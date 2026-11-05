@@ -1,14 +1,18 @@
 // ============================================================
 // Poshakh – shared TypeScript types
+// The scheduling maths lives in "Scheduling engine/" (see src/engine).
+// These types describe what the app stores in SQLite.
 // ============================================================
+import type { BlouseStatus, Priority, Settings } from '../engine';
+
+export type { BlouseStatus, Priority } from '../engine';
 
 export type BlouseType = 'astar' | 'designer';
-export type BlousePriority = 'general' | 'emergency';
-export type BlouseStatus = 'scheduled' | 'done' | 'delivered' | 'cancelled';
+/** Derived from the order's parts and blouses; never edited by hand. */
 export type OrderStatus = 'pending' | 'ready' | 'delivered' | 'cancelled';
 
 // ----------------------------------------------------------------
-// Domain entities (mirror the SQLite schema)
+// Stored rows (mirror the SQLite schema)
 // ----------------------------------------------------------------
 
 export interface Customer {
@@ -17,26 +21,45 @@ export interface Customer {
   phone?: string;
 }
 
+/** One visit of a customer. */
 export interface Order {
   id: number;
   customerId: number;
   createdAt: string; // ISO date-time
   status: OrderStatus;
   notes?: string;
+  /** Money received in advance for this order (₹). */
+  advance: number;
+  /** Customer's old unpaid amount added to this order (₹). */
+  previousDue: number;
 }
 
-export interface BlouseItem {
+/** One delivery of an order (a split order has an emergency and a general part). */
+export interface OrderPart {
   id: number;
   orderId: number;
+  priority: Priority;
+  promisedDelivery: string; // YYYY-MM-DD
+  deliveredOn?: string;     // YYYY-MM-DD
+  cancelled: boolean;
+}
+
+export interface Blouse {
+  id: number;
+  partId: number;
+  orderId: number;
   type: BlouseType;
+  /** Her own label, e.g. "Wedding blouse". */
+  name?: string;
   price: number;
-  priority: BlousePriority;
-  scheduledDate: string;          // YYYY-MM-DD
-  promisedDeliveryDate: string;   // YYYY-MM-DD
   status: BlouseStatus;
-  doneAt?: string;
-  deliveredAt?: string;
+  doneDate?: string; // YYYY-MM-DD, the day it was actually stitched
   paid: boolean;
+}
+
+export interface CustomerSummary extends Customer {
+  lastOrderAt?: string;
+  orderCount: number;
 }
 
 export interface DayOff {
@@ -45,72 +68,31 @@ export interface DayOff {
   label?: string;
 }
 
-export interface AppSettings {
-  workingDays: number[];           // 0=Sun … 6=Sat
-  weeklyTarget: number;            // default 10
-  emergencyReserve: number;        // default 3
-  dailyMax: number;                // default ceil(target / workingDays.length)
-  spareDaysBeforeDelivery: number; // default 1
-  priceAstar: number;              // default 300
-  priceDesigner: number;           // default 400
-}
-
-// ----------------------------------------------------------------
-// Scheduling-engine value types (no DB ids)
-// ----------------------------------------------------------------
-
-export interface DayLoad {
-  date: string;       // YYYY-MM-DD
-  generalUsed: number;
-  emergencyUsed: number;
-  generalCap: number;
-  emergencyCap: number;
-}
-
-export interface WeekCapacity {
-  weekStart: string;  // Monday YYYY-MM-DD
-  used: number;
-  target: number;     // weeklyTarget
-  generalUsed: number;
-  emergencyUsed: number;
-}
-
-export interface ScheduleResult {
-  /** Each element = one blouse, in stitching order */
-  assignments: BlouseAssignment[];
-  /** The overall delivery date (last stitch day + spare days) */
-  deliveryDate: string;
-  /** Whether any week/day limit was exceeded */
-  overLimit: boolean;
-  overLimitDetail?: string;
-}
-
-export interface BlouseAssignment {
-  type: BlouseType;
-  priority: BlousePriority;
-  scheduledDate: string;
-  promisedDeliveryDate: string;
-}
-
-export interface NewOrderInput {
-  astarCount: number;
-  designerCount: number;
-  emergencyCount: number; // total blouses that are emergency (designer or astar)
-  customDate?: string;    // YYYY-MM-DD override
+/** Engine settings (minus holidays, which live in their own table) plus prices. */
+export interface AppSettings extends Omit<Settings, 'daysOff'> {
+  priceAstar: number;
+  priceDesigner: number;
 }
 
 // ----------------------------------------------------------------
 // UI helper types
 // ----------------------------------------------------------------
 
-export interface TodayBlouseGroup {
-  customerName: string;
-  orderId: number;
-  items: BlouseItem[];
-}
-
-export interface OrderWithCustomer extends Order {
+/** A blouse joined with its part, order and customer, for lists. */
+export interface BlouseView extends Blouse {
   customerName: string;
   customerPhone?: string;
-  items: BlouseItem[];
+  priority: Priority;
+  promisedDelivery: string;
+  partDeliveredOn?: string;
+}
+
+export interface PartWithBlouses extends OrderPart {
+  blouses: Blouse[];
+}
+
+export interface OrderWithDetails {
+  order: Order;
+  customer: Customer;
+  parts: PartWithBlouses[];
 }

@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "lib": [
+      "ES2020"
+    ],
+    "strict": true,
+    "esModuleInterop": true,
+    "types": [
+      "jest",
+      "node"
+    ],
+    "moduleResolution": "node",
+    "jsx": "react",
+    "skipLibCheck": true
+  },
+  "include": [
+    "__tests__/**/*.ts",
+    "src/engine/**/*.ts",
+    "src/types/**/*.ts",
+    "src/utils/**/*.ts",
+    "src/strings/**/*.ts",
+    "Scheduling engine/src/**/*.ts"
+  ]
+}

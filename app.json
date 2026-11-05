@@ -1,25 +1,56 @@
 {
   "expo": {
-    "name": "Poshakh",
-    "slug": "Poshakh",
+    "name": "Paridhan",
+    "slug": "paridhan",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "icon": "./assets/icon-ios.png"
     },
     "android": {
+      "icon": "./assets/icon.png",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "package": "com.poshakh.tailor",
+      "versionCode": 1,
+      "permissions": []
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sqlite",
+      "expo-sharing",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#440023"
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 240,
+          "resizeMode": "contain",
+          "backgroundColor": "#FFFFFF"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": false
+    },
+    "extra": {
+      "eas": {
+        "projectId": "7e37c9a4-4ee8-4e6b-af6b-d6eaa9b2b5f6"
+      }
     }
   }
 }
