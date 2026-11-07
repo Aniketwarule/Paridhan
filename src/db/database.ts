@@ -467,6 +467,15 @@ export function loadOrdersWithDetails(status: OrderStatus): OrderWithDetails[] {
   return detailsFor(rows.map(rowToOrder));
 }
 
+/** A customer's orders not yet fully delivered, oldest first. */
+export function loadUndeliveredOrders(customerId: number): OrderWithDetails[] {
+  const rows = getDb().getAllSync<any>(
+    `SELECT * FROM orders WHERE customer_id = ? AND status IN ('pending', 'ready') ORDER BY created_at, id`,
+    [customerId],
+  );
+  return detailsFor(rows.map(rowToOrder));
+}
+
 export function loadOrderDetails(orderId: number): OrderWithDetails | null {
   const r = getDb().getFirstSync<any>(`SELECT * FROM orders WHERE id = ?`, [orderId]);
   return r ? detailsFor([rowToOrder(r)])[0] : null;

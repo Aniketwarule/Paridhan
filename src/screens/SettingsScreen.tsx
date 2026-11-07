@@ -172,19 +172,19 @@ export function SettingsScreen() {
   };
 
   // ── Demo / seed data ──────────────────────────────────────────
-  const handleSeedData = () => {
-    Alert.alert(STRINGS.settingsDemoTitle, STRINGS.settingsDemoConfirm, [
-      { text: STRINGS.cancel, style: 'cancel' },
-      {
-        text: STRINGS.load,
-        onPress: () => {
-          loadSeedData(settings, daysOff.map(d => d.date));
-          refresh();
-          Alert.alert(STRINGS.done, STRINGS.settingsDemoLoaded);
-        },
-      },
-    ]);
-  };
+  // const handleSeedData = () => {
+  //   Alert.alert(STRINGS.settingsDemoTitle, STRINGS.settingsDemoConfirm, [
+  //     { text: STRINGS.cancel, style: 'cancel' },
+  //     {
+  //       text: STRINGS.load,
+  //       onPress: () => {
+  //         loadSeedData(settings, daysOff.map(d => d.date));
+  //         refresh();
+  //         Alert.alert(STRINGS.done, STRINGS.settingsDemoLoaded);
+  //       },
+  //     },
+  //   ]);
+  // };
 
   const upcoming = daysOff.filter(d => d.date >= today);
 

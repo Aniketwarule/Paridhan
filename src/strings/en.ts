@@ -228,6 +228,11 @@ export const en = {
   // ── Bill ──────────────────────────────────────────────────────
   billButton: 'Bill',
   billShareOrSend: 'Send bill',
+  billPickTitle: 'Orders on this bill',
+  billPickHint: 'Tick one order or many. They all go on one bill.',
+  billSelectAll: 'Select all',
+  billMake: (n: number) => (n > 1 ? `Make bill of ${n} orders` : 'Make bill'),
+  billOrderCount: (n: number) => `${n} orders`,
   billTitle: 'BILL',
   billOrderNo: 'Order no.',
   billOrderDate: 'Order date',

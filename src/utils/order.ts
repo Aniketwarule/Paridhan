@@ -22,6 +22,11 @@ export function matchesOrderNo(id: number, query: string): boolean {
 
 const liveBlouses = (p: PartWithBlouses) => (p.cancelled ? [] : p.blouses.filter(b => b.status !== 'cancelled'));
 
+/** The order's live blouses, noting which ones have been handed over. */
+function billableBlouses(card: OrderWithDetails) {
+  return card.parts.flatMap(p => liveBlouses(p).map(b => ({ ...b, delivered: !!p.deliveredOn })));
+}
+
 /** One bill line: identical blouses are merged into one line with a quantity. */
 export interface BillItem {
   label: string;
@@ -41,30 +46,50 @@ export interface BillDelivery {
 }
 
 /**
- * What the customer owes for an order. Kept deliberately simple:
- * blouses + old balance − advance − blouses marked paid.
+ * What the customer owes for an order: blouses + old balance − advance − money received.
+ * A delivery means the money was received, so delivered blouses count as paid, and once
+ * everything is delivered the order is settled (old balance included).
  */
-export function orderMoney(order: { advance: number; previousDue: number }, blouses: { price: number; paid: boolean }[]) {
+export function orderMoney(
+  order: { advance: number; previousDue: number },
+  blouses: { price: number; paid: boolean; delivered?: boolean }[],
+) {
   const subtotal = blouses.reduce((s, b) => s + b.price, 0);
-  const paid = blouses.filter(b => b.paid).reduce((s, b) => s + b.price, 0);
   const total = subtotal + order.previousDue;
+  const owed = Math.max(0, total - order.advance);
+  const settled = blouses.length > 0 && blouses.every(b => b.delivered);
+  const received = blouses.filter(b => b.paid || b.delivered).reduce((s, b) => s + b.price, 0);
+  const paid = settled ? owed : Math.min(received, owed);
   return {
     subtotal,
     previousDue: order.previousDue,
     total,
     advance: order.advance,
     paid,
-    balance: total - order.advance - paid,
+    balance: settled ? 0 : total - order.advance - paid,
   };
 }
 
-export interface BillData {
+/** orderMoney for a loaded order. */
+export function cardMoney(card: OrderWithDetails) {
+  return orderMoney(card.order, billableBlouses(card));
+}
+
+/** One order's lines on a bill. */
+export interface BillOrder {
   orderNo: string;
   orderDate: string;
-  customerName: string;
-  customerPhone?: string;
   items: BillItem[];
   deliveries: BillDelivery[];
+}
+
+/** A bill for one order, or several orders of one customer added together. */
+export interface BillData {
+  /** "P-0042", or "P-0042, P-0043" for several orders. */
+  orderNo: string;
+  customerName: string;
+  customerPhone?: string;
+  orders: BillOrder[];
   /** Total number of blouses. */
   count: number;
   /** Blouses only. */
@@ -100,23 +125,40 @@ export function groupBlouses(
   return [...lines.values()];
 }
 
-export function buildBill(card: OrderWithDetails, label: (b: { type: string; name?: string }) => string): BillData {
+function buildBillOrder(card: OrderWithDetails, label: (b: { type: string; name?: string }) => string): BillOrder {
   const live = card.parts.filter(p => liveBlouses(p).length > 0);
-  const all = live.flatMap(p => liveBlouses(p).map(b => ({ b, priority: p.priority })));
-  const money = orderMoney(card.order, all.map(x => x.b));
   return {
     orderNo: orderNo(card.order.id),
     orderDate: fmt(card.order.createdAt.slice(0, 10)),
-    customerName: card.customer.name,
-    customerPhone: card.customer.phone,
-    items: groupBlouses(all, label),
+    items: groupBlouses(live.flatMap(p => liveBlouses(p).map(b => ({ b, priority: p.priority }))), label),
     deliveries: live.map(p => ({
       priority: live.length > 1 ? p.priority : null,
       date: fmt(p.deliveredOn ?? p.promisedDelivery),
       delivered: !!p.deliveredOn,
     })),
-    count: all.length,
-    ...money,
+  };
+}
+
+/** One bill for one or more orders of the same customer; the money is added up across them. */
+export function buildBill(
+  cards: OrderWithDetails | OrderWithDetails[],
+  label: (b: { type: string; name?: string }) => string,
+): BillData {
+  const list = Array.isArray(cards) ? cards : [cards];
+  const moneys = list.map(cardMoney);
+  const sum = (pick: (m: ReturnType<typeof cardMoney>) => number) => moneys.reduce((s, m) => s + pick(m), 0);
+  return {
+    orderNo: list.map(c => orderNo(c.order.id)).join(', '),
+    customerName: list[0].customer.name,
+    customerPhone: list[0].customer.phone,
+    orders: list.map(c => buildBillOrder(c, label)),
+    count: list.reduce((s, c) => s + billableBlouses(c).length, 0),
+    subtotal: sum(m => m.subtotal),
+    previousDue: sum(m => m.previousDue),
+    total: sum(m => m.total),
+    advance: sum(m => m.advance),
+    paid: sum(m => m.paid),
+    balance: sum(m => m.balance),
   };
 }
 
@@ -149,18 +191,25 @@ export function billText(bill: BillData, shop: ShopInfo): string {
   const contact = shopContactLine(shop);
   if (contact) lines.push(contact);
   lines.push(`*${S.billTitle}*`, '');
-  lines.push(`${S.billOrderNo}: ${bill.orderNo}`);
-  lines.push(`${S.billOrderDate}: ${bill.orderDate}`);
+  const several = bill.orders.length > 1;
+  if (!several) {
+    lines.push(`${S.billOrderNo}: ${bill.orders[0].orderNo}`);
+    lines.push(`${S.billOrderDate}: ${bill.orders[0].orderDate}`);
+  }
   lines.push(`${S.billCustomer}: ${bill.customerName}`);
   lines.push('');
-  bill.items.forEach((it, i) => {
-    const tag = it.priority === 'emergency' ? ` (${S.emergency})` : '';
-    const each = it.qty > 1 ? ` (${S.billEach(it.price)})` : '';
-    lines.push(`${i + 1}. ${itemTitle(it)}${tag} – ₹${it.amount}${each}`);
-  });
-  lines.push('');
-  for (const d of bill.deliveries) lines.push(`${deliveryLabel(d)}: ${deliveryValue(d)}`);
-  lines.push('');
+  let n = 0;
+  for (const o of bill.orders) {
+    if (several) lines.push(`*${o.orderNo} · ${o.orderDate}*`);
+    for (const it of o.items) {
+      const tag = it.priority === 'emergency' ? ` (${S.emergency})` : '';
+      const each = it.qty > 1 ? ` (${S.billEach(it.price)})` : '';
+      lines.push(`${++n}. ${itemTitle(it)}${tag} – ₹${it.amount}${each}`);
+    }
+    lines.push('');
+    for (const d of o.deliveries) lines.push(`${deliveryLabel(d)}: ${deliveryValue(d)}`);
+    lines.push('');
+  }
   for (const [k, v] of moneyLines(bill)) lines.push(`${k}: ${v}`);
   lines.push(`*${S.billBalance}: ₹${bill.balance}*`);
   lines.push('', S.billThanks);

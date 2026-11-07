@@ -231,6 +231,11 @@ export const mr: Strings = {
   // ── Bill ──────────────────────────────────────────────────────
   billButton: 'बिल',
   billShareOrSend: 'बिल पाठवा',
+  billPickTitle: 'या बिलात कोणत्या ऑर्डर?',
+  billPickHint: 'एक किंवा जास्त ऑर्डर निवडा. सगळ्यांचं मिळून एकच बिल होईल.',
+  billSelectAll: 'सगळ्या निवडा',
+  billMake: (n: number) => (n > 1 ? `${n} ऑर्डरचं बिल करा` : 'बिल करा'),
+  billOrderCount: (n: number) => `${n} ऑर्डर`,
   billTitle: 'बिल',
   billOrderNo: 'ऑर्डर नं.',
   billOrderDate: 'ऑर्डरची तारीख',

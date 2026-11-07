@@ -1,5 +1,6 @@
 import { billText, buildBill, groupBlouses, itemTitle, matchesOrderNo, moneyLines, orderNo, whatsappUrl } from '../src/utils/order';
 import type { Blouse, OrderWithDetails } from '../src/types';
+import { STRINGS } from '../src/strings';
 
 const card: OrderWithDetails = {
   order: { id: 42, customerId: 1, createdAt: '2026-11-05T10:00:00.000Z', status: 'pending', advance: 0, previousDue: 0 },
@@ -36,10 +37,11 @@ describe('order numbers', () => {
 describe('bill', () => {
   const bill = buildBill(card, b => b.name ?? b.type);
   it('leaves out cancelled blouses and adds up paid and balance', () => {
-    expect(bill.items.map(i => i.label)).toEqual(['designer', 'Green silk']);
+    expect(bill.orders[0].items.map(i => i.label)).toEqual(['designer', 'Green silk']);
     expect(bill.count).toBe(2);
-    expect(bill).toMatchObject({ orderNo: 'P-0042', orderDate: '05/11/2026', total: 700, paid: 400, balance: 300 });
-    expect(bill.deliveries).toEqual([
+    expect(bill).toMatchObject({ orderNo: 'P-0042', total: 700, paid: 400, balance: 300 });
+    expect(bill.orders[0].orderDate).toBe('05/11/2026');
+    expect(bill.orders[0].deliveries).toEqual([
       { priority: 'emergency', date: '08/11/2026', delivered: false },
       { priority: 'general', date: '15/11/2026', delivered: false },
     ]);
@@ -85,7 +87,56 @@ describe('grouping blouses on the bill', () => {
 
   it('labels a single delivery without urgency', () => {
     const one: OrderWithDetails = { ...card, parts: [card.parts[1]] };
-    expect(buildBill(one, label).deliveries).toEqual([{ priority: null, date: '15/11/2026', delivered: false }]);
+    expect(buildBill(one, label).orders[0].deliveries).toEqual([{ priority: null, date: '15/11/2026', delivered: false }]);
+  });
+});
+
+describe('delivered means the money was received', () => {
+  const delivered = (c: OrderWithDetails, partIds: number[]): OrderWithDetails => ({
+    ...c,
+    parts: c.parts.map(p => (partIds.includes(p.id) ? { ...p, deliveredOn: '2026-11-20' } : p)),
+  });
+  const withMoney = (advance: number, previousDue: number): OrderWithDetails => ({
+    ...card,
+    order: { ...card.order, advance, previousDue },
+    parts: card.parts.map(p => ({ ...p, blouses: p.blouses.map(b => ({ ...b, paid: false })) })),
+  });
+
+  it('settles the whole order once everything is delivered', () => {
+    const bill = buildBill(delivered(withMoney(200, 150), [1, 2]), b => b.type);
+    expect(bill).toMatchObject({ total: 850, advance: 200, paid: 650, balance: 0 });
+  });
+  it('counts only the delivered part while the rest is still with her', () => {
+    const bill = buildBill(delivered(withMoney(200, 150), [1]), b => b.type);
+    expect(bill).toMatchObject({ total: 850, advance: 200, paid: 400, balance: 250 });
+  });
+  it('does not count the advance twice', () => {
+    const bill = buildBill(delivered(withMoney(700, 0), [1, 2]), b => b.type);
+    expect(bill).toMatchObject({ total: 700, advance: 700, paid: 0, balance: 0 });
+  });
+});
+
+describe('bill for several orders', () => {
+  const second: OrderWithDetails = {
+    ...card,
+    order: { ...card.order, id: 43, advance: 100 },
+    parts: [{
+      id: 3, orderId: 43, priority: 'general', promisedDelivery: '2026-11-20', cancelled: false,
+      blouses: [{ id: 4, partId: 3, orderId: 43, type: 'astar', price: 500, status: 'scheduled', paid: false }],
+    }],
+  };
+  const bill = buildBill([card, second], b => b.name ?? b.type);
+
+  it('adds the money up across the orders', () => {
+    expect(bill.orderNo).toBe('P-0042, P-0043');
+    expect(bill.orders.map(o => o.orderNo)).toEqual(['P-0042', 'P-0043']);
+    expect(bill).toMatchObject({ count: 3, subtotal: 1200, total: 1200, advance: 100, paid: 400, balance: 700 });
+  });
+  it('lists each order in the WhatsApp text', () => {
+    const text = billText(bill, { name: 'Shop', tailor: '', phone: '' });
+    expect(text).toContain('*P-0042 ');
+    expect(text).toContain('*P-0043 ');
+    expect(text).toContain('3. astar');
   });
 });
 
@@ -95,7 +146,7 @@ describe('advance and old balance', () => {
     const bill = buildBill(withMoney, b => b.name ?? b.type);
     // blouses 700 (400 paid), old balance 150, advance 200
     expect(bill).toMatchObject({ subtotal: 700, previousDue: 150, total: 850, advance: 200, paid: 400, balance: 250 });
-    expect(moneyLines(bill).map(([k]) => k)).toEqual(['Total (2 blouses)', 'Old balance', 'Total amount', 'Advance received', 'Paid']);
+    expect(moneyLines(bill).map(([k]) => k)).toEqual(['Total (2 blouses)', STRINGS.billPreviousDue, 'Total amount', 'Advance received', 'Paid']);
   });
 
   it('keeps the bill short when there is nothing extra', () => {

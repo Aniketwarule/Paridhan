@@ -1,5 +1,5 @@
 // ============================================================
-// Paridhan – order bill: preview, share as image, send on WhatsApp
+// Paridhan – order bill: pick orders, preview, share as image, send on WhatsApp
 // ============================================================
 import React, { useRef, useState } from 'react';
 import { Alert, Linking, Modal, ScrollView, StyleSheet, Text, View } from 'react-native';
@@ -7,23 +7,108 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
 import { STRINGS } from '../strings';
+import { fmt } from '../utils/date';
 import * as DB from '../db/database';
 import type { OrderWithDetails } from '../types';
 import {
-  billText, buildBill, deliveryLabel, deliveryValue, itemTitle, moneyLines, shopContactLine, whatsappUrl,
-  type BillData, type ShopInfo,
+  billText, buildBill, cardMoney, deliveryLabel, deliveryValue, itemTitle, moneyLines, shopContactLine, whatsappUrl,
+  orderNo, type BillData, type ShopInfo,
 } from '../utils/order';
 import { blouseLabel } from '../utils/labels';
-import { Actions, BrandLogo, Button, COLORS, FONT, LAYOUT, ModalHeader, Row, SPACE } from './ui';
+import { Actions, BrandLogo, Button, Checkbox, COLORS, FONT, LAYOUT, ModalHeader, Row, Section, Separator, SPACE, Tag } from './ui';
 
-export function OrderBillModal({
-  card, visible, onClose,
-}: { card: OrderWithDetails; visible: boolean; onClose: () => void }) {
+/**
+ * Starts from `card`. If the customer has other undelivered orders she first ticks which ones
+ * go on the bill (one or many). Otherwise, or from a delivered order, that order's own bill
+ * opens straight away. Mount it only while it is open.
+ */
+export function OrderBillModal({ card, onClose }: { card: OrderWithDetails; onClose: () => void }) {
+  const [orders] = useState(() => (card.order.status === 'delivered' ? [] : DB.loadUndeliveredOrders(card.customer.id)));
+  const canPick = orders.length > 1;
+  const [picked, setPicked] = useState<number[]>([card.order.id]);
+  const [picking, setPicking] = useState(canPick);
+  const backFromBill = canPick ? () => setPicking(true) : onClose;
+
+  return (
+    <Modal visible animationType="slide" onRequestClose={picking ? onClose : backFromBill}>
+      {picking ? (
+        <OrderPicker
+          orders={orders}
+          picked={picked}
+          customerName={card.customer.name}
+          onChange={setPicked}
+          onBack={onClose}
+          onNext={() => setPicking(false)}
+        />
+      ) : (
+        <BillPreview cards={canPick ? orders.filter(o => picked.includes(o.order.id)) : [card]} onBack={backFromBill} />
+      )}
+    </Modal>
+  );
+}
+
+function OrderPicker({
+  orders, picked, customerName, onChange, onBack, onNext,
+}: {
+  orders: OrderWithDetails[];
+  picked: number[];
+  customerName: string;
+  onChange: (ids: number[]) => void;
+  onBack: () => void;
+  onNext: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const S = STRINGS;
+  const toggle = (id: number) => onChange(picked.includes(id) ? picked.filter(x => x !== id) : [...picked, id]);
+  const allPicked = picked.length === orders.length;
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      <ModalHeader
+        title={S.billPickTitle}
+        subtitle={customerName}
+        onBack={onBack}
+        right={allPicked ? undefined : (
+          <Button label={S.billSelectAll} size="small" variant="secondary" onPress={() => onChange(orders.map(o => o.order.id))} />
+        )}
+      />
+      <ScrollView contentContainerStyle={{ paddingBottom: LAYOUT.screenBottom }}>
+        <Section subtitle={S.billPickHint}>
+          {[...orders].reverse().map((o, i) => {
+            const money = cardMoney(o);
+            return (
+              <View key={o.order.id}>
+                {i > 0 && <Separator inset={0} />}
+                <Checkbox
+                  label={`${orderNo(o.order.id)} · ${fmt(o.order.createdAt.slice(0, 10))}`}
+                  value={picked.includes(o.order.id)}
+                  onChange={() => toggle(o.order.id)}
+                />
+                <Row style={styles.pickInfo}>
+                  <Text style={styles.pickText}>₹{money.total} · {S.ordersBalance(money.balance)}</Text>
+                  <Tag label={o.order.status === 'ready' ? S.ordersReady : S.ordersPending} color={COLORS.textMuted} />
+                </Row>
+              </View>
+            );
+          })}
+        </Section>
+      </ScrollView>
+      <View style={[styles.footer, { paddingBottom: SPACE.sm + insets.bottom }]}>
+        <Actions style={styles.footerActions}>
+          <Button label={S.billMake(picked.length)} icon="receipt-outline" onPress={onNext} disabled={picked.length === 0} />
+        </Actions>
+      </View>
+    </View>
+  );
+}
+
+function BillPreview({ cards, onBack }: { cards: OrderWithDetails[]; onBack: () => void }) {
   const insets = useSafeAreaInsets();
   const billRef = useRef<React.ComponentRef<typeof View>>(null);
   const [busy, setBusy] = useState(false);
-  const bill = buildBill(card, blouseLabel);
+  const bill = buildBill(cards, blouseLabel);
   const shop = DB.getShopInfo();
+  const several = cards.length > 1;
 
   const shareImage = async () => {
     if (busy) return;
@@ -33,7 +118,7 @@ export function OrderBillModal({
         format: 'png',
         quality: 1,
         result: 'tmpfile',
-        fileName: `bill-${bill.orderNo}`,
+        fileName: `bill-${bill.orderNo.replace(/, /g, '-')}`,
       });
       if (!(await Sharing.isAvailableAsync())) throw new Error(STRINGS.billShareUnavailable);
       await Sharing.shareAsync(uri, { mimeType: 'image/png', UTI: 'public.png', dialogTitle: STRINGS.billShare });
@@ -45,7 +130,7 @@ export function OrderBillModal({
   };
 
   const sendWhatsApp = async () => {
-    const url = whatsappUrl(card.customer.phone, billText(bill, shop));
+    const url = whatsappUrl(bill.customerPhone, billText(bill, shop));
     try {
       await Linking.openURL(url);
     } catch {
@@ -54,39 +139,42 @@ export function OrderBillModal({
   };
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <View style={[styles.container, { paddingTop: insets.top }]}>
-        <ModalHeader title={`${STRINGS.billTitle} · ${bill.orderNo}`} subtitle={bill.customerName} onBack={onClose} />
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      <ModalHeader
+        title={`${STRINGS.billTitle} · ${several ? STRINGS.billOrderCount(cards.length) : bill.orderNo}`}
+        subtitle={bill.customerName}
+        onBack={onBack}
+      />
 
-        <ScrollView contentContainerStyle={styles.scroll}>
-          {/* This view is what becomes the image. */}
-          <View ref={billRef} collapsable={false} style={styles.billWrap}>
-            <BillView bill={bill} shop={shop} />
-          </View>
-          {!shop.tailor && !shop.phone && <Text style={styles.hint}>{STRINGS.billShopHint}</Text>}
-        </ScrollView>
-
-        <View style={[styles.footer, { paddingBottom: SPACE.sm + insets.bottom }]}>
-          <Actions style={styles.footerActions}>
-            <Button label={STRINGS.billWhatsApp} icon="logo-whatsapp" variant="whatsapp" onPress={sendWhatsApp} disabled={busy} />
-            <Button
-              label={busy ? STRINGS.loading : STRINGS.billShare}
-              icon="share-social-outline"
-              onPress={shareImage}
-              disabled={busy}
-              variant="secondary"
-            />
-          </Actions>
+      <ScrollView contentContainerStyle={styles.scroll}>
+        {/* This view is what becomes the image. */}
+        <View ref={billRef} collapsable={false} style={styles.billWrap}>
+          <BillView bill={bill} shop={shop} />
         </View>
+        {!shop.tailor && !shop.phone && <Text style={styles.hint}>{STRINGS.billShopHint}</Text>}
+      </ScrollView>
+
+      <View style={[styles.footer, { paddingBottom: SPACE.sm + insets.bottom }]}>
+        <Actions style={styles.footerActions}>
+          <Button label={STRINGS.billWhatsApp} icon="logo-whatsapp" variant="whatsapp" onPress={sendWhatsApp} disabled={busy} />
+          <Button
+            label={busy ? STRINGS.loading : STRINGS.billShare}
+            icon="share-social-outline"
+            onPress={shareImage}
+            disabled={busy}
+            variant="secondary"
+          />
+        </Actions>
       </View>
-    </Modal>
+    </View>
   );
 }
 
 /** The printed-looking bill: plain and minimal, with the logo on top. Kept free of buttons. */
 function BillView({ bill, shop }: { bill: BillData; shop: ShopInfo }) {
   const S = STRINGS;
-  const contact = shopContactLine(shop);
+  const several = bill.orders.length > 1;
+  let line = 0;
   return (
     <View style={styles.bill}>
       <View style={styles.hero}>
@@ -96,14 +184,14 @@ function BillView({ bill, shop }: { bill: BillData; shop: ShopInfo }) {
         ) : null}
 
         {shop.phone ? (
-          <Text style={styles.phone}>{shop.phone}</Text>
+          <Text style={styles.phone}>{'+91 '+shop.phone}</Text>
         ) : null}
         <Text style={styles.billLabel }>{S.billTitle}</Text>
       </View>
 
       <View style={styles.dash} />
-      <KV k={S.billOrderNo} v={bill.orderNo} />
-      <KV k={S.billOrderDate} v={bill.orderDate} />
+      {!several && <KV k={S.billOrderNo} v={bill.orders[0].orderNo} />}
+      {!several && <KV k={S.billOrderDate} v={bill.orders[0].orderDate} />}
       <KV k={S.billCustomer} v={bill.customerName} />
       {bill.customerPhone ? <KV k={S.billPhone} v={bill.customerPhone} /> : null}
       <View style={styles.dash} />
@@ -113,23 +201,27 @@ function BillView({ bill, shop }: { bill: BillData; shop: ShopInfo }) {
         <Text style={[styles.th, { flex: 1 }]}>{S.billItem}</Text>
         <Text style={[styles.th, styles.right]}>{S.billAmount}</Text>
       </Row>
-      {bill.items.map((it, i) => (
-        <Row key={i} style={styles.tr}>
-          <Text style={[styles.td, styles.numCol]}>{i + 1}</Text>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.td}>{itemTitle(it)}</Text>
-            {it.qty > 1 ? <Text style={styles.sub}>{S.billEach(it.price)}</Text> : null}
-            {it.priority === 'emergency' ? <Text style={styles.urgent}>⚡ {S.emergency}</Text> : null}
-          </View>
-          <Text style={[styles.td, styles.right]}>₹{it.amount}</Text>
-        </Row>
+      {bill.orders.map(o => (
+        <View key={o.orderNo}>
+          {several && <Text style={styles.orderHead}>{o.orderNo} · {o.orderDate}</Text>}
+          {o.items.map((it, i) => (
+            <Row key={i} style={styles.tr}>
+              <Text style={[styles.td, styles.numCol]}>{++line}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.td}>{itemTitle(it)}</Text>
+                {it.qty > 1 ? <Text style={styles.sub}>{S.billEach(it.price)}</Text> : null}
+                {it.priority === 'emergency' ? <Text style={styles.urgent}>⚡ {S.emergency}</Text> : null}
+              </View>
+              <Text style={[styles.td, styles.right]}>₹{it.amount}</Text>
+            </Row>
+          ))}
+          <View style={styles.dash} />
+          {o.deliveries.map((d, i) => (
+            <KV key={i} k={deliveryLabel(d)} v={deliveryValue(d)} />
+          ))}
+          <View style={styles.dash} />
+        </View>
       ))}
-      <View style={styles.dash} />
-
-      {bill.deliveries.map((d, i) => (
-        <KV key={i} k={deliveryLabel(d)} v={deliveryValue(d)} />
-      ))}
-      <View style={styles.dash} />
 
       {moneyLines(bill).map(([k, v], i) => <KV key={i} k={k} v={v} />)}
       <KV k={S.billBalance} v={`₹${bill.balance}`} big />
@@ -153,6 +245,9 @@ const styles = StyleSheet.create({
   scroll: { padding: LAYOUT.gutter, paddingBottom: LAYOUT.screenBottom },
   billWrap: { backgroundColor: '#fff' },
   hint: { fontSize: FONT.sizeSmall, color: COLORS.textMuted, textAlign: 'center', marginTop: SPACE.md },
+  pickInfo: { justifyContent: 'space-between', gap: SPACE.sm, paddingHorizontal: LAYOUT.inset, paddingBottom: LAYOUT.rowY },
+  pickText: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, flexShrink: 1 },
+  orderHead: { fontSize: FONT.sizeSmall, fontWeight: FONT.weightBold, color: COLORS.text, paddingTop: SPACE.xs },
   footer: { paddingTop: SPACE.sm, backgroundColor: COLORS.bg, borderTopWidth: 1, borderTopColor: COLORS.border },
   footerActions: { paddingHorizontal: LAYOUT.gutter, paddingVertical: 0 },
 

@@ -45,7 +45,7 @@ import {
 } from '../components/ui';
 import { fmt, fmtShort } from '../utils/date';
 import { blouseLabel } from '../utils/labels';
-import { matchesOrderNo, orderMoney, orderNo } from '../utils/order';
+import { cardMoney, matchesOrderNo, orderNo } from '../utils/order';
 import { OrderBillModal } from '../components/OrderBill';
 
 const liveBlouses = (p: PartWithBlouses) => (p.cancelled ? [] : p.blouses.filter(b => b.status !== 'cancelled'));
@@ -165,7 +165,7 @@ function OrderDetail({ orderId, onClose }: { orderId: number; onClose: () => voi
   const [billOpen, setBillOpen] = useState(false);
 
   if (!card) return null;
-  const money = orderMoney(card.order, card.parts.flatMap(liveBlouses));
+  const money = cardMoney(card);
   const open = card.order.status === 'pending' || card.order.status === 'ready';
 
   const handleCancel = () => {
@@ -248,7 +248,7 @@ function OrderDetail({ orderId, onClose }: { orderId: number; onClose: () => voi
         </Actions>
       </ScrollView>
 
-      <OrderBillModal card={card} visible={billOpen} onClose={() => setBillOpen(false)} />
+      {billOpen && <OrderBillModal card={card} onClose={() => setBillOpen(false)} />}
     </View>
   );
 }
@@ -375,7 +375,7 @@ function PartSection({
                 </Row>
               ) : (
                 <Row style={styles.itemLine}>
-                  <Text style={styles.itemPrice}>₹{item.price}{item.paid ? `   ${STRINGS.todayPaid}` : ''}</Text>
+                  <Text style={styles.itemPrice}>₹{item.price}{item.paid || delivered ? `   ${STRINGS.todayPaid}` : ''}</Text>
                   {!isCancelled && (
                     <Button
                       label={STRINGS.ordersEditPrice}

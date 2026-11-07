@@ -5,6 +5,7 @@ import React from 'react';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { NavigationContainer } from '@react-navigation/native';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TodayScreen } from '../screens/TodayScreen';
 import { NewOrderScreen } from '../screens/NewOrderScreen';
 import { OrdersScreen } from '../screens/OrdersScreen';
@@ -28,6 +29,8 @@ function tabIcon(idle: IoniconName, active: IoniconName) {
 export function AppNavigator() {
   // Re-render tab labels when the language changes.
   useAppContext();
+  // Space taken by the phone's own Back/Home buttons or gesture bar.
+  const insets = useSafeAreaInsets();
   return (
     <NavigationContainer>
       <Tab.Navigator
@@ -41,8 +44,8 @@ export function AppNavigator() {
             backgroundColor: COLORS.bg,
             borderTopColor: COLORS.border,
             borderTopWidth: 1,
-            height: 64,
-            paddingBottom: SPACE.sm,
+            height: 64 + insets.bottom,
+            paddingBottom: SPACE.sm + insets.bottom,
           },
           tabBarLabelStyle: {
             fontSize: FONT.sizeSmall,
