@@ -22,6 +22,8 @@ function simulate(opts: {
   tickNextMorning?: boolean;
   /** Each morning, if something is late, she accepts the catch-up suggestion. */
   acceptCatchUp?: boolean;
+  /** Share of orders that include one full-day piece (nav-vari). */
+  fullDayShare?: number;
 }) {
   let r = opts.seed;
   const rnd = () => ((r = (r * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
@@ -34,6 +36,8 @@ function simulate(opts: {
   let pendingTicks: string[] = [];
   let quotedDays = 0;
   let quoteSum = 0;
+  let fullDaysStitched = 0;
+  let fullDayShared = 0; // days a full-day piece shared with other work
 
   for (let day = 0; day < opts.days; day++) {
     const today = w.today;
@@ -60,16 +64,19 @@ function simulate(opts: {
         const count = 1 + Math.floor(rnd() * 3);
         const split = count > 1 && rnd() < 0.15;
         const prio: Priority = rnd() < (opts.emergencyShare ?? 0.2) ? 'emergency' : 'general';
+        const fullDayCount = opts.fullDayShare && rnd() < opts.fullDayShare ? 1 : 0;
         const req = split
-          ? [{ count: 1, priority: 'emergency' as const }, { count: count - 1, priority: 'general' as const }]
-          : [{ count, priority: prio }];
+          ? [{ count: 1, priority: 'emergency' as const }, { count: count - 1, fullDayCount, priority: 'general' as const }]
+          : [{ count, fullDayCount, priority: prio }];
         const qs = quote(w, req);
         if (qs.some((q) => !q.dateOffered)) continue;
         seq++;
         qs.forEach((q) => { quotedDays++; quoteSum += (Date.parse(q.dateOffered!) - Date.parse(today)) / 864e5; });
         const rec = confirmOrder({ id: `o${seq}`, customerId: `c${seq % 7}`, createdAt: seq }, qs.map((q, i) => ({
           partId: `p${seq}_${i}`, priority: q.priority, promisedDelivery: q.dateOffered!,
-          blouses: Array.from({ length: q.count }, (_, j) => ({ id: `b${seq}_${i}_${j}`, price: 500 })),
+          blouses: Array.from({ length: q.count }, (_, j) => ({
+            id: `b${seq}_${i}_${j}`, price: 500, fullDay: j < (req[i].fullDayCount ?? 0),
+          })),
         })));
         w.orders.push(rec.order); w.parts.push(...rec.parts); w.blouses.push(...rec.blouses);
       }
@@ -77,6 +84,9 @@ function simulate(opts: {
 
     // She stitches (after customers, like real life: list may have changed during the day).
     const list = rebuildSchedule(w).today.blouseIds;
+    const fullToday = list.filter((id) => w.blouses.find((b) => b.id === id)?.fullDay).length;
+    fullDaysStitched += fullToday;
+    if (fullToday > 0 && list.length > 1) fullDayShared++;
     const doneIds = opts.behaviour ? opts.behaviour(today, list, rnd) : list;
     if (opts.tickNextMorning) pendingTicks = doneIds;
     else w.blouses = w.blouses.map((b) => (doneIds.includes(b.id) ? { ...b, status: 'done', doneDate: today } : b));
@@ -91,7 +101,7 @@ function simulate(opts: {
     }
     w.today = addDays(today, 1);
   }
-  return { w, missed, lateFlagDays, avgLeadDays: quoteSum / Math.max(1, quotedDays) };
+  return { w, missed, lateFlagDays, fullDaysStitched, fullDayShared, avgLeadDays: quoteSum / Math.max(1, quotedDays) };
 }
 
 describe('simulation: she follows the app', () => {
@@ -109,6 +119,43 @@ describe('simulation: she follows the app', () => {
   });
   it('holidays configured in advance', () => {
     const res = simulate({ days: 60, seed: 11, settings: { daysOff: ['2026-11-11', '2026-11-12', '2026-12-25'] } });
+    expect(res.missed).toEqual([]);
+  });
+});
+
+describe('simulation: nav-vari orders mixed in', () => {
+  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    it(`seed ${seed}: 12 weeks, every promise kept, every nav-vari alone on its day`, () => {
+      const res = simulate({ days: 84, seed, fullDayShare: 0.25 });
+      expect(res.fullDaysStitched).toBeGreaterThan(5);
+      expect(res.fullDayShared).toBe(0);
+      expect(res.missed).toEqual([]);
+      expect(res.lateFlagDays).toEqual([]);
+    });
+  }
+  it('busy season with many nav-vari orders: dates get later, promises hold', () => {
+    const res = simulate({ days: 84, seed: 9, ordersPerDay: 3, emergencyShare: 0.35, fullDayShare: 0.4 });
+    expect(res.fullDayShared).toBe(0);
+    expect(res.missed).toEqual([]);
+    expect(res.avgLeadDays).toBeGreaterThan(7);
+  }, 30000);
+  it('holiday weeks', () => {
+    const res = simulate({
+      days: 60, seed: 11, fullDayShare: 0.25, settings: { daysOff: ['2026-11-11', '2026-11-12', '2026-12-25'] },
+    });
+    expect(res.fullDayShared).toBe(0);
+    expect(res.missed).toEqual([]);
+  });
+  it('a lower weekly target with uneven days (7 a week: 2,1,2,1,1)', () => {
+    const res = simulate({ days: 84, seed: 12, ordersPerDay: 0.6, fullDayShare: 0.25, settings: { weeklyTarget: 7, emergencyReserve: 2 } });
+    expect(res.fullDayShared).toBe(0);
+    expect(res.missed).toEqual([]);
+  });
+  it('one sick day: shows late flags, recovers', () => {
+    const res = simulate({
+      days: 84, seed: 4, ordersPerDay: 1.2, fullDayShare: 0.25,
+      behaviour: (day, list) => (day === '2026-11-18' ? [] : list),
+    });
     expect(res.missed).toEqual([]);
   });
 });

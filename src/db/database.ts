@@ -1,9 +1,11 @@
 // ============================================================
 // Poshakh – Database layer (expo-sqlite)
 //
-// Customer ──< Order ──< OrderPart ──< Blouse
+// Customer ──< Order ──< OrderPart ──< Blouse (stitching work)
+//                                  └─< SmallWork (bill only)
 // Stitch dates are never stored: the scheduling engine works them out
 // from the parts' promised dates every time (see src/engine).
+// Small work never reaches the engine, so it can't use up schedule time.
 // ============================================================
 import * as SQLite from 'expo-sqlite';
 import { DEFAULT_SETTINGS, type DayExtra, type EngineData, type Priority, type WeekExtra, type Weekday } from '../engine';
@@ -21,9 +23,12 @@ import type {
   OrderStatus,
   OrderWithDetails,
   PartWithBlouses,
+  SmallWork,
+  SmallWorkKind,
 } from '../types';
+import type { EditChanges } from '../utils/orderEdit';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   weeklyTarget: DEFAULT_SETTINGS.weeklyTarget,
@@ -36,6 +41,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   weekStartsOn: DEFAULT_SETTINGS.weekStartsOn,
   priceAstar: 300,
   priceDesigner: 400,
+  rates: {},
 };
 
 // ── Open database ────────────────────────────────────────────
@@ -67,6 +73,21 @@ export async function initDb(): Promise<void> {
     const orderCols = new Set(db.getAllSync<{ name: string }>(`PRAGMA table_info(orders)`).map(c => c.name));
     if (!orderCols.has('advance')) db.execSync(`ALTER TABLE orders ADD COLUMN advance INTEGER NOT NULL DEFAULT 0`);
     if (!orderCols.has('previous_due')) db.execSync(`ALTER TABLE orders ADD COLUMN previous_due INTEGER NOT NULL DEFAULT 0`);
+    // v5: small work that only goes on the bill (alters, piko, parkar, anything else).
+    db.execSync(`
+      CREATE TABLE IF NOT EXISTS small_work (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        part_id INTEGER NOT NULL REFERENCES order_parts(id),
+        order_id INTEGER NOT NULL REFERENCES orders(id),
+        kind TEXT NOT NULL,
+        name TEXT,
+        qty INTEGER NOT NULL DEFAULT 1,
+        price INTEGER NOT NULL,
+        paid INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_small_work_part ON small_work(part_id);
+      CREATE INDEX IF NOT EXISTS idx_small_work_order ON small_work(order_id);
+    `);
     db.execSync(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   });
 }
@@ -226,10 +247,12 @@ export function loadSettings(): AppSettings {
     weekStartsOn: row.week_starts_on as Weekday,
     priceAstar: row.price_astar,
     priceDesigner: row.price_designer,
+    rates: getState<AppSettings['rates']>('rates') ?? {},
   };
 }
 
 export function saveSettings(s: AppSettings): void {
+  setState('rates', s.rates);
   getDb().runSync(
     `UPDATE settings SET working_days = ?, weekly_target = ?, emergency_reserve = ?, emergency_gap = ?,
        normal_gap = ?, delivery_days = ?, allow_new_work_today = ?, week_starts_on = ?, price_astar = ?,
@@ -303,15 +326,27 @@ export interface ShopInfo {
   name: string;
   tailor: string;
   phone: string;
+  /** Where the QR on the bill sends the money. */
+  upi: string;
 }
 
 export function getShopInfo(): ShopInfo {
   const s = getState<Partial<ShopInfo>>('shop');
-  return { name: s?.name ?? '', tailor: s?.tailor ?? '', phone: s?.phone ?? '' };
+  return { name: s?.name ?? '', tailor: s?.tailor ?? '', phone: s?.phone ?? '', upi: s?.upi ?? '' };
 }
 
 export function setShopInfo(info: ShopInfo): void {
-  setState('shop', { name: info.name.trim(), tailor: info.tailor.trim(), phone: info.phone.trim() });
+  setState('shop', { name: info.name.trim(), tailor: info.tailor.trim(), phone: info.phone.trim(), upi: info.upi.trim() });
+}
+
+// ── Last backup ───────────────────────────────────────────────
+/** The day she last sent a backup out, or null if she never has. */
+export function getLastBackup(): string | null {
+  return getState<string>('lastBackup');
+}
+
+export function setLastBackup(date: string): void {
+  setState('lastBackup', date);
 }
 
 // ── Customers ─────────────────────────────────────────────────
@@ -400,11 +435,25 @@ function rowToBlouse(r: any): Blouse {
   };
 }
 
+function rowToSmallWork(r: any): SmallWork {
+  return {
+    id: r.id,
+    partId: r.part_id,
+    orderId: r.order_id,
+    kind: r.kind as SmallWorkKind,
+    name: r.name ?? undefined,
+    qty: r.qty,
+    price: r.price,
+    paid: r.paid === 1,
+  };
+}
+
 // ── Orders ────────────────────────────────────────────────────
 export interface NewPart {
   priority: Priority;
   promisedDelivery: string;
   blouses: { type: BlouseType; price: number; name?: string }[];
+  smallWork?: { kind: SmallWorkKind; qty: number; price: number; name?: string }[];
 }
 
 /** Save a confirmed order with its parts and blouses in one transaction. */
@@ -424,7 +473,8 @@ export function createOrder(
       [customerId, createdAt, notes ?? null, money?.advance ?? 0, money?.previousDue ?? 0],
     ).lastInsertRowId;
     for (const p of parts) {
-      if (p.blouses.length === 0) continue;
+      const small = p.smallWork ?? [];
+      if (p.blouses.length === 0 && small.length === 0) continue;
       const partId = db.runSync(
         `INSERT INTO order_parts (order_id, priority, promised_delivery) VALUES (?, ?, ?)`,
         [orderId, p.priority, p.promisedDelivery],
@@ -435,7 +485,15 @@ export function createOrder(
           [partId, orderId, b.type, b.name?.trim() || null, b.price],
         );
       }
+      for (const w of small) {
+        db.runSync(
+          `INSERT INTO small_work (part_id, order_id, kind, name, qty, price) VALUES (?, ?, ?, ?, ?, ?)`,
+          [partId, orderId, w.kind, w.name?.trim() || null, w.qty, w.price],
+        );
+      }
     }
+    // An order with only small work has nothing to stitch, so it is ready straight away.
+    syncOrderStatus(orderId);
   });
   return orderId;
 }
@@ -448,6 +506,7 @@ function detailsFor(orders: Order[]): OrderWithDetails[] {
     `SELECT * FROM order_parts WHERE order_id IN (${ids}) ORDER BY promised_delivery, id`,
   ).map(rowToPart);
   const blouses = db.getAllSync<any>(`SELECT * FROM blouses WHERE order_id IN (${ids}) ORDER BY id`).map(rowToBlouse);
+  const smallWork = db.getAllSync<any>(`SELECT * FROM small_work WHERE order_id IN (${ids}) ORDER BY id`).map(rowToSmallWork);
   const customers = new Map<number, Customer>();
   for (const r of db.getAllSync<any>(
     `SELECT id, name, phone FROM customers WHERE id IN (${orders.map(o => o.customerId).join(',')})`,
@@ -458,7 +517,11 @@ function detailsFor(orders: Order[]): OrderWithDetails[] {
     customer: customers.get(order.customerId) ?? { id: order.customerId, name: '—' },
     parts: parts
       .filter(p => p.orderId === order.id)
-      .map(p => ({ ...p, blouses: blouses.filter(b => b.partId === p.id) })),
+      .map(p => ({
+        ...p,
+        blouses: blouses.filter(b => b.partId === p.id),
+        smallWork: smallWork.filter(w => w.partId === p.id),
+      })),
   }));
 }
 
@@ -498,12 +561,18 @@ export function cancelOrder(orderId: number): void {
   });
 }
 
-/** Order status is derived: delivered when every live part is handed over, ready when every blouse is stitched. */
+/**
+ * Order status is derived: delivered when every live part is handed over, ready when nothing
+ * is left to stitch. Small work keeps a part live but never holds an order back.
+ */
 export function syncOrderStatus(orderId: number): void {
   const db = getDb();
   const parts = db.getAllSync<any>(`SELECT * FROM order_parts WHERE order_id = ?`, [orderId]).map(rowToPart);
   const blouses = db.getAllSync<any>(`SELECT * FROM blouses WHERE order_id = ?`, [orderId]).map(rowToBlouse);
-  const live = parts.filter(p => !p.cancelled && blouses.some(b => b.partId === p.id && b.status !== 'cancelled'));
+  const small = new Set(
+    db.getAllSync<{ part_id: number }>(`SELECT DISTINCT part_id FROM small_work WHERE order_id = ?`, [orderId]).map(r => r.part_id),
+  );
+  const live = parts.filter(p => !p.cancelled && (small.has(p.id) || blouses.some(b => b.partId === p.id && b.status !== 'cancelled')));
   let status: OrderStatus;
   if (live.length === 0) status = 'cancelled';
   else if (live.every(p => p.deliveredOn)) status = 'delivered';
@@ -511,6 +580,70 @@ export function syncOrderStatus(orderId: number): void {
     status = 'ready';
   } else status = 'pending';
   db.runSync(`UPDATE orders SET status = ? WHERE id = ?`, [status, orderId]);
+}
+
+// ── Editing a saved order ─────────────────────────────────────
+/** Writes the changes from the Edit Order screen. Call inside a transaction. */
+function writeOrderEdit(c: EditChanges): void {
+  const db = getDb();
+  if (c.createdAt) db.runSync(`UPDATE orders SET created_at = ? WHERE id = ?`, [c.createdAt, c.orderId]);
+  for (const p of c.parts) {
+    db.runSync(`UPDATE order_parts SET promised_delivery = ?, priority = ? WHERE id = ? AND delivered_on IS NULL`, [p.date, p.priority, p.id]);
+  }
+  for (const id of c.blouseRemoves) db.runSync(`DELETE FROM blouses WHERE id = ? AND order_id = ?`, [id, c.orderId]);
+  for (const id of c.smallRemoves) db.runSync(`DELETE FROM small_work WHERE id = ? AND order_id = ?`, [id, c.orderId]);
+  for (const b of c.blouseUpdates) {
+    db.runSync(`UPDATE blouses SET type = ?, name = ?, price = ? WHERE id = ? AND order_id = ?`, [b.type, b.name || null, b.price, b.id, c.orderId]);
+  }
+  for (const w of c.smallUpdates) {
+    db.runSync(
+      `UPDATE small_work SET kind = ?, name = ?, price = ?, qty = ? WHERE id = ? AND order_id = ?`,
+      [w.kind, w.name || null, w.price, w.qty, w.id, c.orderId],
+    );
+  }
+  for (const b of c.blouseAdds) {
+    db.runSync(
+      `INSERT INTO blouses (part_id, order_id, type, name, price, status) VALUES (?, ?, ?, ?, ?, 'scheduled')`,
+      [b.partId, c.orderId, b.type, b.name || null, b.price],
+    );
+  }
+  for (const w of c.smallAdds) {
+    db.runSync(
+      `INSERT INTO small_work (part_id, order_id, kind, name, qty, price) VALUES (?, ?, ?, ?, ?, ?)`,
+      [w.partId, c.orderId, w.kind, w.name || null, w.qty, w.price],
+    );
+  }
+  // A delivery with nothing left goes away (with any cancelled pieces still pointing at it).
+  for (const id of c.emptyParts) {
+    db.runSync(`DELETE FROM blouses WHERE part_id = ? AND status = 'cancelled'`, [id]);
+    const left = db.getFirstSync(`SELECT 1 FROM blouses WHERE part_id = ? UNION SELECT 1 FROM small_work WHERE part_id = ?`, [id, id]);
+    if (!left) db.runSync(`DELETE FROM order_parts WHERE id = ? AND delivered_on IS NULL`, [id]);
+  }
+  syncOrderStatus(c.orderId);
+}
+
+export function saveOrderEdit(c: EditChanges): void {
+  getDb().withTransactionSync(() => writeOrderEdit(c));
+}
+
+const ROLLBACK = new Error('rollback');
+
+/**
+ * Runs `measure` as if the edit were saved, then throws the edit away.
+ * Used to ask the schedule "what would happen?" before saving.
+ */
+export function tryOrderEdit<T>(c: EditChanges, measure: () => T): T {
+  let out: T | undefined;
+  try {
+    getDb().withTransactionSync(() => {
+      writeOrderEdit(c);
+      out = measure();
+      throw ROLLBACK;
+    });
+  } catch (e) {
+    if (e !== ROLLBACK) throw e;
+  }
+  return out as T;
 }
 
 // ── Parts ─────────────────────────────────────────────────────
@@ -532,7 +665,50 @@ export function updatePartDate(partId: number, date: string, priority?: Priority
 }
 
 export function setPartPaid(partId: number, paid: boolean): void {
-  getDb().runSync(`UPDATE blouses SET paid = ? WHERE part_id = ? AND status != 'cancelled'`, [paid ? 1 : 0, partId]);
+  const db = getDb();
+  db.runSync(`UPDATE blouses SET paid = ? WHERE part_id = ? AND status != 'cancelled'`, [paid ? 1 : 0, partId]);
+  db.runSync(`UPDATE small_work SET paid = ? WHERE part_id = ?`, [paid ? 1 : 0, partId]);
+}
+
+// ── Small work ────────────────────────────────────────────────
+/** Price of one piece. */
+export function updateSmallWorkPrice(id: number, price: number): void {
+  getDb().runSync(`UPDATE small_work SET price = ? WHERE id = ?`, [price, id]);
+}
+
+export function updateSmallWorkQty(id: number, qty: number): void {
+  getDb().runSync(`UPDATE small_work SET qty = ? WHERE id = ?`, [qty, id]);
+}
+
+/** Add to an order already saved. */
+export function addSmallWork(
+  partId: number,
+  work: { kind: SmallWorkKind; qty: number; price: number; name?: string },
+): void {
+  const orderId = orderOfPart(partId);
+  if (orderId === null) return;
+  getDb().runSync(
+    `INSERT INTO small_work (part_id, order_id, kind, name, qty, price) VALUES (?, ?, ?, ?, ?, ?)`,
+    [partId, orderId, work.kind, work.name?.trim() || null, work.qty, work.price],
+  );
+  syncOrderStatus(orderId);
+}
+
+export function removeSmallWork(id: number): void {
+  const db = getDb();
+  const r = db.getFirstSync<{ order_id: number }>(`SELECT order_id FROM small_work WHERE id = ?`, [id]);
+  if (!r) return;
+  db.runSync(`DELETE FROM small_work WHERE id = ?`, [id]);
+  syncOrderStatus(r.order_id);
+}
+
+/** Small work by delivery, for showing it next to the stitching it goes with. */
+export function loadSmallWorkByPart(partIds: number[]): Map<number, SmallWork[]> {
+  const out = new Map<number, SmallWork[]>();
+  if (partIds.length === 0) return out;
+  const rows = getDb().getAllSync<any>(`SELECT * FROM small_work WHERE part_id IN (${partIds.join(',')}) ORDER BY id`).map(rowToSmallWork);
+  for (const w of rows) out.set(w.partId, [...(out.get(w.partId) ?? []), w]);
+  return out;
 }
 
 // ── Blouses ───────────────────────────────────────────────────
@@ -615,7 +791,7 @@ export interface ReadyPart extends PartWithBlouses {
   customerPhone?: string;
 }
 
-/** Parts whose blouses are all stitched but not yet handed over. */
+/** Parts with nothing left to stitch, not yet handed over. Small-work-only parts wait here too. */
 export function loadReadyParts(): ReadyPart[] {
   const db = getDb();
   const rows = db.getAllSync<any>(
@@ -624,19 +800,21 @@ export function loadReadyParts(): ReadyPart[] {
      JOIN orders o ON o.id = p.order_id
      JOIN customers c ON c.id = o.customer_id
      WHERE p.delivered_on IS NULL AND p.cancelled = 0
-       AND EXISTS (SELECT 1 FROM blouses b WHERE b.part_id = p.id AND b.status = 'done')
+       AND (EXISTS (SELECT 1 FROM blouses b WHERE b.part_id = p.id AND b.status = 'done')
+         OR EXISTS (SELECT 1 FROM small_work w WHERE w.part_id = p.id))
        AND NOT EXISTS (SELECT 1 FROM blouses b WHERE b.part_id = p.id AND b.status = 'scheduled')
      ORDER BY p.promised_delivery`,
   );
   if (rows.length === 0) return [];
-  const blouses = db.getAllSync<any>(
-    `SELECT * FROM blouses WHERE part_id IN (${rows.map(r => r.id).join(',')}) AND status != 'cancelled'`,
-  ).map(rowToBlouse);
+  const ids = rows.map(r => r.id).join(',');
+  const blouses = db.getAllSync<any>(`SELECT * FROM blouses WHERE part_id IN (${ids}) AND status != 'cancelled'`).map(rowToBlouse);
+  const smallWork = db.getAllSync<any>(`SELECT * FROM small_work WHERE part_id IN (${ids}) ORDER BY id`).map(rowToSmallWork);
   return rows.map(r => ({
     ...rowToPart(r),
     customerName: r.customer_name,
     customerPhone: r.customer_phone ?? undefined,
     blouses: blouses.filter(b => b.partId === r.id),
+    smallWork: smallWork.filter(w => w.partId === r.id),
   }));
 }
 
@@ -666,18 +844,22 @@ export function loadEngineData(doneSince: string): EngineData {
 
 // ── Reports ───────────────────────────────────────────────────
 /** Parts and blouses touching [from, to]: stitched, delivered or due in the range. */
-export function loadReportRows(from: string, to: string): { parts: OrderPart[]; blouses: Blouse[] } {
+export function loadReportRows(from: string, to: string): { parts: OrderPart[]; blouses: Blouse[]; smallWork: SmallWork[] } {
   const db = getDb();
   const parts = db.getAllSync<any>(
     `SELECT DISTINCT p.* FROM order_parts p LEFT JOIN blouses b ON b.part_id = p.id
      WHERE (p.delivered_on BETWEEN ? AND ?) OR (p.promised_delivery BETWEEN ? AND ?) OR (b.done_date BETWEEN ? AND ?)`,
     [from, to, from, to, from, to],
   ).map(rowToPart);
-  if (parts.length === 0) return { parts, blouses: [] };
-  const blouses = db.getAllSync<any>(
-    `SELECT * FROM blouses WHERE part_id IN (${parts.map(p => p.id).join(',')})`,
-  ).map(rowToBlouse);
-  return { parts, blouses };
+  if (parts.length === 0) return { parts, blouses: [], smallWork: [] };
+  const ids = parts.map(p => p.id).join(',');
+  const blouses = db.getAllSync<any>(`SELECT * FROM blouses WHERE part_id IN (${ids})`).map(rowToBlouse);
+  const smallWork = db.getAllSync<any>(`SELECT * FROM small_work WHERE part_id IN (${ids})`).map(rowToSmallWork);
+  return { parts, blouses, smallWork };
+}
+
+export function hasOrders(): boolean {
+  return !!getDb().getFirstSync(`SELECT 1 FROM orders LIMIT 1`);
 }
 
 export function countOpenBlouses(): number {

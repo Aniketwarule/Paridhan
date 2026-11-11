@@ -5,6 +5,8 @@ import type { Change, DateStr, EngineInput, ScheduleResult } from './types';
 export interface CoreSchedule {
   stitch: Map<string, DayNum | null>;
   latest: Map<string, DayNum | null>;
+  /** Slots each placed piece uses: 1, or what was left of the day for a full-day piece. */
+  slots: Map<string, number>;
 }
 
 /** Nearest deadline first, emergency before general, oldest order first. */
@@ -24,6 +26,9 @@ export function edfCompare(latest: Map<string, DayNum | null>) {
  * first, and fill working days from today up to the daily amount and the weekly
  * total. Work is done as early as possible, so she is never idle when work exists;
  * an emergency simply pushes far-deadline work to a later day.
+ *
+ * A full-day piece goes only on a day with nothing done or planned, and closes that day.
+ * If the day has already been started, it waits and the next pieces use up the room left.
  */
 export function scheduleCore(ctx: Ctx, items: WorkItem[]): CoreSchedule {
   const open = items.filter((i) => i.open);
@@ -31,23 +36,57 @@ export function scheduleCore(ctx: Ctx, items: WorkItem[]): CoreSchedule {
   for (const it of open) latest.set(it.id, latestStitchFor(ctx, it.promised, it.priority));
   const sorted = [...open].sort(edfCompare(latest));
   const stitch = new Map<string, DayNum | null>();
+  const slots = new Map<string, number>();
 
-  let i = 0;
+  let next = 0;
+  /** Full-day pieces passed over so far; they stay ahead of everything still in `sorted`. */
+  let waiting: WorkItem[] = [];
   let ws = NaN;
   let slotsLeft = 0;
   const last = ctx.today + 2 * HORIZON_DAYS;
-  for (let d = ctx.today; d <= last && i < sorted.length; d++) {
+  for (let d = ctx.today; d <= last && (next < sorted.length || waiting.length > 0); d++) {
     const w = weekOf(ctx, d);
     if (w !== ws) {
       ws = w;
       slotsLeft = weekSlots(ctx, w, 'W');
     }
-    const k = Math.min(Math.max(0, Math.min(slotsLeft, dayCap(ctx, d, 'W'))), sorted.length - i);
-    for (let j = 0; j < k; j++) stitch.set(sorted[i++].id, d);
-    slotsLeft -= k;
+    const room = Math.max(0, Math.min(slotsLeft, dayCap(ctx, d, 'W')));
+    if (room === 0) continue;
+
+    let used = 0;
+    const startedAlready = d === ctx.today && ctx.doneToday > 0;
+    const place = (it: WorkItem, take: number) => {
+      stitch.set(it.id, d);
+      slots.set(it.id, take);
+      used += take;
+    };
+    const stillWaiting: WorkItem[] = [];
+    const tryFullDay = (it: WorkItem) => {
+      if (used === 0 && !startedAlready) place(it, room);
+      else stillWaiting.push(it);
+    };
+    waiting.forEach(tryFullDay);
+    while (used < room && next < sorted.length) {
+      const it = sorted[next++];
+      if (it.fullDay) tryFullDay(it);
+      else place(it, 1);
+    }
+    slotsLeft -= used;
+    waiting = stillWaiting;
   }
-  for (; i < sorted.length; i++) stitch.set(sorted[i].id, null);
-  return { stitch, latest };
+  for (const it of [...waiting, ...sorted.slice(next)]) stitch.set(it.id, null);
+  return { stitch, latest, slots };
+}
+
+/** Slots used per week: what is done plus what the schedule plans. */
+export function usedByWeek(ctx: Ctx, core: CoreSchedule): Map<DayNum, number> {
+  const used = new Map<DayNum, number>(ctx.doneByWeek);
+  for (const [id, d] of core.stitch) {
+    if (d === null) continue;
+    const w = weekOf(ctx, d);
+    used.set(w, (used.get(w) ?? 0) + (core.slots.get(id) ?? 1));
+  }
+  return used;
 }
 
 /** Public entry point: rebuild the stitch schedule. Pure and deterministic. */
@@ -104,5 +143,6 @@ export function rebuildSchedule(input: EngineInput, previous?: Record<string, Da
     todayTarget: dayTarget(ctx, ctx.today, 'W'),
     doneTodayCount: ctx.doneToday,
     late, lateParts: partsOf(late), willMiss, willMissParts: partsOf(willMiss), changes,
+    weekLoad: Object.fromEntries([...usedByWeek(ctx, core)].map(([w, n]) => [fromDay(w), n])),
   };
 }

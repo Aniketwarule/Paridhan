@@ -2,7 +2,7 @@ import { DayNum, fromDay, toDay } from './dates';
 import {
   Ctx, HORIZON_DAYS, WorkItem, dayCap, firstViolation, isDeliveryDay, isWorking, latestStitchFor, makeCtx, weekOf,
 } from './core';
-import { CoreSchedule, rebuildSchedule, scheduleCore } from './schedule';
+import { CoreSchedule, rebuildSchedule, scheduleCore, usedByWeek } from './schedule';
 import type {
   Blouse, DateCheck, DateStr, EngineInput, Order, OrderPart, Priority, QuotePart, QuotePartRequest, DayExtra, WeekUsage,
 } from './types';
@@ -15,8 +15,14 @@ interface Prepared {
   base: CoreSchedule;
   /** Deadlines of existing unfinished blouses (late ones use their real catch-up day). */
   existing: DayNum[];
+  /** The same deadlines by blouse id. */
+  allowed: Map<string, DayNum>;
+  /** Any unfinished full-day piece? Then "enough slots in total" is no longer enough. */
+  hasFullDay: boolean;
   /** First day a new order may be stitched. */
   release: DayNum;
+  /** Deadline given to work that does not fit in the horizon at all. */
+  far: DayNum;
 }
 
 /** An already-quoted part of the same order (split orders). */
@@ -24,6 +30,8 @@ export interface PriorPart {
   count: number;
   priority: Priority;
   date: DateStr;
+  /** How many of `count` take a whole day each. Default 0. */
+  fullDayCount?: number;
 }
 
 function prepare(input: EngineInput): Prepared {
@@ -31,16 +39,27 @@ function prepare(input: EngineInput): Prepared {
   const base = scheduleCore(ctx, ctx.items);
   const far = ctx.today + 2 * HORIZON_DAYS;
   const existing: DayNum[] = [];
+  const allowed = new Map<string, DayNum>();
   for (const [id, s] of base.stitch) {
     const l = base.latest.get(id) ?? null;
     // A late blouse keeps the day it can actually be done, so new work never pushes it further.
-    existing.push(s === null ? far : l === null ? s : Math.max(l, s));
+    const deadline = s === null ? far : l === null ? s : Math.max(l, s);
+    existing.push(deadline);
+    allowed.set(id, deadline);
   }
   const release = ctx.settings.allowNewWorkToday ? ctx.today : ctx.today + 1;
-  return { input, ctx, base, existing, release };
+  const hasFullDay = ctx.items.some((it) => it.open && it.fullDay);
+  return { input, ctx, base, existing, allowed, hasFullDay, release, far };
 }
 
-interface NewItem { deadline: DayNum; count: number }
+interface NewItem {
+  deadline: DayNum;
+  count: number;
+  /** How many of `count` take a whole day each. */
+  fullDays: number;
+  priority: Priority;
+  date: DayNum;
+}
 
 function expand(items: NewItem[]): DayNum[] {
   const out: DayNum[] = [];
@@ -48,31 +67,90 @@ function expand(items: NewItem[]): DayNum[] {
   return out;
 }
 
+/** Work items for parts not saved yet; the first `fullDays` of each part take a whole day. */
+function newWorkItems(parts: { count: number; fullDays: number; priority: Priority; date: DayNum | null }[]): WorkItem[] {
+  const out: WorkItem[] = [];
+  parts.forEach((pt, i) => {
+    if (pt.date === null) return;
+    for (let j = 0; j < pt.count; j++) {
+      out.push({
+        id: `__new_${i}_${j}`, partId: `__new_${i}`, priority: pt.priority, promised: pt.date,
+        createdAt: Number.MAX_SAFE_INTEGER, open: true, fullDay: j < pt.fullDays,
+      });
+    }
+  });
+  return out;
+}
+
 /**
- * The delivery-date maths: existing + earlier parts + n new blouses due by L must
- * all fit. General work must also fit inside G per week, spread over the days,
- * which keeps room for emergencies.
+ * The delivery-date maths: existing + earlier parts + the new blouses due by their
+ * deadline must all fit. General work must also fit inside G per week, spread over
+ * the days, which keeps room for emergencies.
  */
-function violation(P: Prepared, prior: NewItem[], L: DayNum, n: number, p: Priority): DayNum | null {
+function violation(P: Prepared, prior: NewItem[], me: NewItem): DayNum | null {
+  const fresh = [...prior, me];
+  if (P.hasFullDay || fresh.some((x) => x.fullDays > 0)) return placedViolation(P, fresh, me);
+
   const { ctx, existing } = P;
   const today = ctx.today;
-  const fresh = [...expand(prior), ...expand([{ deadline: L, count: n }])];
-  const all = [...existing, ...fresh];
+  const freshDeadlines = expand(fresh);
+  const all = [...existing, ...freshDeadlines];
 
   let v = firstViolation(ctx, all, { start: today, mode: 'W' });
   if (v !== null) return v;
   if (P.release > today) {
-    v = firstViolation(ctx, fresh, { start: P.release, mode: 'W' });
+    v = firstViolation(ctx, freshDeadlines, { start: P.release, mode: 'W' });
     if (v !== null) return v;
   }
-  if (p === 'general') {
+  if (me.priority === 'general') {
     const forced = new Map<DayNum, number>();
     for (const d of [...existing, ...expand(prior)]) {
       const ws = weekOf(ctx, Math.max(d, today));
       forced.set(ws, (forced.get(ws) ?? 0) + 1);
     }
-    v = firstViolation(ctx, all, { start: today, mode: 'G', forced, checkFrom: L });
+    v = firstViolation(ctx, all, { start: today, mode: 'G', forced, checkFrom: me.deadline });
     if (v !== null) return v;
+  }
+  return null;
+}
+
+/**
+ * The same question when a full-day piece is involved. A full-day piece cannot be split,
+ * so enough slots in total does not prove a whole day is free: run the real scheduler
+ * with the new work added and look at where everything lands.
+ */
+function placedViolation(P: Prepared, fresh: NewItem[], me: NewItem): DayNum | null {
+  const { ctx, allowed, far } = P;
+  const today = ctx.today;
+  const added = newWorkItems(fresh);
+  const core = scheduleCore(ctx, [...ctx.items, ...added]);
+  const limit = (id: string) => allowed.get(id) ?? core.latest.get(id) ?? today;
+
+  let first: DayNum | null = null;
+  for (const [id, s] of core.stitch) {
+    const l = limit(id);
+    if (s === null ? l < far : s > l) first = first === null ? l : Math.min(first, l);
+  }
+  if (first !== null) return Math.max(first, today);
+
+  // Same limits as above, with a full-day piece counting the slots it would use.
+  const deadlines = (items: WorkItem[]) => items.flatMap((it) =>
+    new Array<DayNum>(it.fullDay ? core.slots.get(it.id) ?? 1 : 1).fill(limit(it.id)));
+  const mine = `__new_${fresh.length - 1}`;
+  const before = deadlines([...ctx.items.filter((it) => it.open), ...added.filter((it) => it.partId !== mine)]);
+  const all = [...before, ...deadlines(added.filter((it) => it.partId === mine))];
+
+  if (P.release > today) {
+    const v = firstViolation(ctx, deadlines(added), { start: P.release, mode: 'W' });
+    if (v !== null) return v;
+  }
+  if (me.priority === 'general') {
+    const forced = new Map<DayNum, number>();
+    for (const d of before) {
+      const ws = weekOf(ctx, Math.max(d, today));
+      forced.set(ws, (forced.get(ws) ?? 0) + 1);
+    }
+    return firstViolation(ctx, all, { start: today, mode: 'G', forced, checkFrom: me.deadline });
   }
   return null;
 }
@@ -81,22 +159,22 @@ type Classified =
   | { ok: true; L: DayNum }
   | { ok: false; reason: NonNullable<DateCheck['reason']>; at?: DayNum; L?: DayNum };
 
-function classify(P: Prepared, prior: NewItem[], d: DayNum, n: number, p: Priority): Classified {
+function classify(P: Prepared, prior: NewItem[], d: DayNum, n: number, p: Priority, fullDays = 0): Classified {
   const ctx = P.ctx;
   if (d <= ctx.today) return { ok: false, reason: 'too-soon' };
   if (!isDeliveryDay(ctx, d)) return { ok: false, reason: 'not-a-delivery-day' };
   const L = latestStitchFor(ctx, d, p);
   if (L === null) return { ok: false, reason: 'no-working-day' };
   if (L < P.release) return { ok: false, reason: 'too-soon', L };
-  const at = violation(P, prior, L, n, p);
+  const at = violation(P, prior, { deadline: L, count: n, fullDays, priority: p, date: d });
   return at === null ? { ok: true, L } : { ok: false, reason: 'full', at, L };
 }
 
 /** First delivery date from tomorrow within 26 weeks. */
-function earliest(P: Prepared, prior: NewItem[], n: number, p: Priority): { d: DayNum; L: DayNum } | null {
+function earliest(P: Prepared, prior: NewItem[], n: number, p: Priority, fullDays = 0): { d: DayNum; L: DayNum } | null {
   const t = P.ctx.today;
   for (let d = t + 1; d <= t + HORIZON_DAYS; d++) {
-    const c = classify(P, prior, d, n, p);
+    const c = classify(P, prior, d, n, p, fullDays);
     if (c.ok) return { d, L: c.L };
   }
   return null;
@@ -105,32 +183,20 @@ function earliest(P: Prepared, prior: NewItem[], n: number, p: Priority): { d: D
 function priorItems(P: Prepared, prior: PriorPart[]): NewItem[] {
   return prior.map((x) => ({
     count: x.count,
+    fullDays: x.fullDayCount ?? 0,
+    priority: x.priority,
+    date: toDay(x.date),
     deadline: latestStitchFor(P.ctx, toDay(x.date), x.priority) ?? P.ctx.today,
   }));
 }
 
 /** Schedule with the new parts added, for stitch days and week usage. */
-function preview(P: Prepared, parts: { count: number; priority: Priority; date: DayNum | null }[]) {
-  const hyp: WorkItem[] = [];
-  parts.forEach((pt, i) => {
-    if (pt.date === null) return;
-    for (let j = 0; j < pt.count; j++) {
-      hyp.push({
-        id: `__new_${i}_${j}`, partId: `__new_${i}`, priority: pt.priority, promised: pt.date,
-        createdAt: Number.MAX_SAFE_INTEGER, open: true,
-      });
-    }
-  });
-  const core = scheduleCore(P.ctx, [...P.ctx.items, ...hyp]);
-  const usedByWeek = new Map<DayNum, number>(P.ctx.doneByWeek);
-  for (const s of core.stitch.values()) {
-    if (s === null) continue;
-    const ws = weekOf(P.ctx, s);
-    usedByWeek.set(ws, (usedByWeek.get(ws) ?? 0) + 1);
-  }
+function preview(P: Prepared, parts: { count: number; fullDays: number; priority: Priority; date: DayNum | null }[]) {
+  const core = scheduleCore(P.ctx, [...P.ctx.items, ...newWorkItems(parts)]);
+  const used = usedByWeek(P.ctx, core);
   const usage = (ws: DayNum): WeekUsage => ({
     weekStart: fromDay(ws),
-    used: usedByWeek.get(ws) ?? 0,
+    used: used.get(ws) ?? 0,
     capacity: P.ctx.W + (P.ctx.extras.get(ws) ?? 0),
   });
   return parts.map((_, i) => {
@@ -153,15 +219,15 @@ export function quote(input: EngineInput, parts: QuotePartRequest[]): QuotePart[
   const prior: NewItem[] = [];
   const found: { d: DayNum | null; L: DayNum | null }[] = parts.map(() => ({ d: null, L: null }));
   for (const i of order) {
-    const { count, priority } = parts[i];
+    const { count, priority, fullDayCount: fullDays = 0 } = parts[i];
     if (count <= 0) continue;
-    const r = earliest(P, prior, count, priority);
+    const r = earliest(P, prior, count, priority, fullDays);
     if (r) {
       found[i] = { d: r.d, L: r.L };
-      prior.push({ deadline: r.L, count });
+      prior.push({ deadline: r.L, count, fullDays, priority, date: r.d });
     }
   }
-  const pv = preview(P, parts.map((p, i) => ({ ...p, date: found[i].d })));
+  const pv = preview(P, parts.map((p, i) => ({ ...p, fullDays: p.fullDayCount ?? 0, date: found[i].d })));
   return parts.map((p, i) => ({
     priority: p.priority,
     count: p.count,
@@ -173,9 +239,9 @@ export function quote(input: EngineInput, parts: QuotePartRequest[]): QuotePart[
 }
 
 /** General and emergency quotes side by side for the same number of blouses. */
-export function quoteBoth(input: EngineInput, count: number): { general: QuotePart; emergency: QuotePart } {
-  const [general] = quote(input, [{ count, priority: 'general' }]);
-  const [emergency] = quote(input, [{ count, priority: 'emergency' }]);
+export function quoteBoth(input: EngineInput, count: number, fullDayCount = 0): { general: QuotePart; emergency: QuotePart } {
+  const [general] = quote(input, [{ count, fullDayCount, priority: 'general' }]);
+  const [emergency] = quote(input, [{ count, fullDayCount, priority: 'emergency' }]);
   if (general.dateOffered && (!emergency.dateOffered || emergency.dateOffered > general.dateOffered)) {
     return { general, emergency: { ...general, priority: 'emergency' } };
   }
@@ -205,9 +271,10 @@ export function checkDate(input: EngineInput, part: QuotePartRequest, date: Date
   const P = prepare(input);
   const pr = priorItems(P, prior);
   const d = toDay(date);
-  const c = classify(P, pr, d, part.count, part.priority);
+  const fullDays = part.fullDayCount ?? 0;
+  const c = classify(P, pr, d, part.count, part.priority, fullDays);
   if (c.ok) return { ok: true };
-  const e = earliest(P, pr, part.count, part.priority);
+  const e = earliest(P, pr, part.count, part.priority, fullDays);
   const out: DateCheck = { ok: false, reason: c.reason, nearestValid: e ? fromDay(e.d) : null };
   if (c.reason === 'full' && c.at !== undefined && c.L !== undefined) {
     out.fullDay = fromDay(c.at);
@@ -227,7 +294,7 @@ function extraNeeded(
   for (let n = 1; n <= limit; n++) {
     const trial: EngineInput = { ...input, weekExtras: [...(input.weekExtras ?? []), { weekStart, n }] };
     const P = prepare(trial);
-    if (classify(P, priorItems(P, prior), d, part.count, part.priority).ok) return { weekStart, n };
+    if (classify(P, priorItems(P, prior), d, part.count, part.priority, part.fullDayCount ?? 0).ok) return { weekStart, n };
   }
   return null;
 }
@@ -238,7 +305,7 @@ export interface ConfirmPart {
   partId: string;
   priority: Priority;
   promisedDelivery: DateStr;
-  blouses: { id: string; type?: string; price: number }[];
+  blouses: { id: string; type?: string; price: number; fullDay?: boolean }[];
 }
 
 /** Build the records to save when the customer agrees. IDs come from the app. */
@@ -247,7 +314,9 @@ export function confirmOrder(order: Order, parts: ConfirmPart[]): { order: Order
     order,
     parts: parts.map((p) => ({ id: p.partId, orderId: order.id, priority: p.priority, promisedDelivery: p.promisedDelivery })),
     blouses: parts.flatMap((p) =>
-      p.blouses.map((b) => ({ id: b.id, partId: p.partId, type: b.type, price: b.price, status: 'scheduled' as const }))),
+      p.blouses.map((b) => ({
+        id: b.id, partId: p.partId, type: b.type, price: b.price, status: 'scheduled' as const, fullDay: b.fullDay,
+      }))),
   };
 }
 
@@ -281,11 +350,13 @@ export function checkPartDateChange(
 ): DateCheck {
   const part = input.parts.find((p) => p.id === partId);
   if (!part) throw new Error(`Unknown part ${partId}`);
-  const mine = (b: Blouse) => b.partId === partId && b.status === 'scheduled';
-  const count = input.blouses.filter(mine).length;
-  const rest: EngineInput = { ...input, blouses: input.blouses.filter((b) => !mine(b)) };
+  const isMine = (b: Blouse) => b.partId === partId && b.status === 'scheduled';
+  const mine = input.blouses.filter(isMine);
+  const count = mine.length;
+  const fullDayCount = mine.filter((b) => b.fullDay).length;
+  const rest: EngineInput = { ...input, blouses: input.blouses.filter((b) => !isMine(b)) };
   if (count === 0) return toDay(newDate) > toDay(input.today) ? { ok: true } : { ok: false, reason: 'too-soon' };
-  return checkDate(rest, { count, priority: newPriority ?? part.priority }, newDate);
+  return checkDate(rest, { count, fullDayCount, priority: newPriority ?? part.priority }, newDate);
 }
 
 export interface CatchUp {
@@ -306,6 +377,7 @@ export function catchUpExtra(input: EngineInput): CatchUp | null {
   const base = rebuildSchedule(input);
   if (base.late.length === 0) return null;
   const ctx = makeCtx(input);
+  const fullDayIds = ctx.items.filter((it) => it.open && it.fullDay).map((it) => it.id);
   const added = new Map<DayNum, number>();
   const stuck = new Set<string>();
   const build = (): EngineInput => ({
@@ -317,10 +389,12 @@ export function catchUpExtra(input: EngineInput): CatchUp | null {
     const target = s.late.find((id) => !stuck.has(id) && s.latestStitch[id] !== null && s.latestStitch[id]! >= input.today);
     if (!target) break;
     const L = toDay(s.latestStitch[target]!);
+    // A day given to a full-day piece stays closed: nothing extra is asked of it.
+    const closed = new Set(fullDayIds.map((id) => s.stitchDate[id]));
     let pick: DayNum | null = null;
     let pickLoad = Infinity;
     for (let d = ctx.today; d <= L; d++) {
-      if (!isWorking(ctx, d)) continue;
+      if (!isWorking(ctx, d) || closed.has(fromDay(d))) continue;
       const normal = dayCap(ctx, d, 'W');
       const a = added.get(d) ?? 0;
       if (a >= Math.max(1, normal)) continue; // at most double a normal day

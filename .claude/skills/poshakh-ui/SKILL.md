@@ -107,8 +107,21 @@ A single button at the right of a list row is placed directly in the row (no Act
 
 `Card` (tappable summary in a list), `Section`, `Separator`, `Row`, `Tag` (status chip),
 `Segmented` (2–3 way toggle; give it `style={{ marginHorizontal: LAYOUT.inset, marginVertical: SPACE.sm }}`
-inside a Section), `TextField`, `NumberInput`, `NumericTextInput`, `DateField`, `Checkbox`,
-`EmptyState`, `Loading`, `IconButton` (round icon in a ScreenHeader), `CapacityStrip`, `Steps`.
+inside a Section), `TextField`, `NumberInput` (add `inline` for lists of numbers: label and box on
+one line), `NumericTextInput`, `DateField`, `Checkbox`, `EmptyState`, `Loading`, `IconButton` (round icon
+in a ScreenHeader), `CapacityStrip`, `Steps`, `TileGrid` + `WorkTile` (tap to add work; keep tiles where
+they won't shift under her finger), `Stepper` (− n +; at 1 the minus is a bin, and going to 0 means remove).
+`ListRow` (icon, title, one-line "what is set now" subtitle, chevron; `warn` turns the subtitle orange) for
+menus such as the Settings home. `WorkTile selected` shows a tick instead of a count (pickers).
+
+## 6a. Keyboard
+
+- Every screen or modal with text boxes is wrapped in `<KeyboardAvoidingView behavior="padding">` on **both**
+  platforms. Android apps are edge-to-edge, so the window no longer shrinks for the keyboard; without a
+  behavior the boxes stay hidden under it on some phones.
+- Its ScrollView gets `ref` + `{...useKeepInputVisible(ref)}` and `keyboardShouldPersistTaps="handled"`, so the
+  box being typed in scrolls above the keyboard.
+- `useKeyboardVisible()` to hide non-essential bars (summaries) while typing on small phones.
 
 ## 7. Text and languages
 

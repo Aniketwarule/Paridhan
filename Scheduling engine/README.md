@@ -5,7 +5,7 @@ database and no `Date.now()`. The app passes in `today`, the settings and the st
 data, and gets back plain data. Dates are always `"YYYY-MM-DD"` strings.
 
 ```bash
-npm test          # vitest, 54 tests (incl. 12-week day-by-day simulations)
+npm test          # vitest (incl. 12-week day-by-day simulations)
 npm run typecheck
 ```
 
@@ -38,6 +38,12 @@ Customer ──< Order ──< OrderPart ──< Blouse
 - **Today's list**: unfinished blouses with the nearest deadline first, filled as
   early as possible. Far-deadline work is done early. When an emergency arrives, that
   work simply moves to a later day before its own deadline.
+- **Full-day pieces** (`Blouse.fullDay`, e.g. a nav-vari saree) go only on a day with
+  nothing done or planned, and close that day. They use that day's amount, so a nav-vari
+  on a 3-slot day of a holiday week counts 3. If the day has already started, the piece
+  waits for the next free day and other work uses up the room left. Quotes that involve a
+  full-day piece run the real scheduler to see where everything lands, because enough
+  slots in total does not prove a whole day is free. Blouse-only quotes use the count.
 
 ## API
 
@@ -50,8 +56,8 @@ Every call takes an `EngineInput`:
 | Function | Use in the app |
 |---|---|
 | `rebuildSchedule(input, previousStitchDates?)` | Today screen and calendar. Returns `queue`, `today`, `todayTarget`, `doneTodayCount`, `days`, `stitchDate`, `late`/`lateParts`, `willMiss`/`willMissParts`, `changes`. Call it after every change. |
-| `quoteBoth(input, n)` | New order: general and emergency dates side by side. |
-| `quote(input, parts)` | Split order, e.g. `[{count:2, priority:'emergency'}, {count:3, priority:'general'}]`. |
+| `quoteBoth(input, n, fullDayCount?)` | New order: general and emergency dates side by side. |
+| `quote(input, parts)` | Split order, e.g. `[{count:2, priority:'emergency'}, {count:3, fullDayCount:1, priority:'general'}]`. `fullDayCount` says how many of `count` take a whole day. |
 | `maxByDate(input, date, priority, prior?)` | "How many can be ready by Friday?" |
 | `checkDate(input, part, date, prior?)` | Customer's own date. Returns `ok`, or the reason, `nearestValid`, `fullWeek`, and `extraNeeded` for "Take extra anyway". |
 | `checkPartDateChange(input, partId, newDate, newPriority?)` | Customer wants an existing delivery moved. Same answer shape as `checkDate`. |
@@ -64,10 +70,10 @@ Every call takes an `EngineInput`:
 
 ## Rules the app must follow
 
-1. **Today screen = a queue.** Show the top `todayTarget - doneTodayCount` items of
-   `queue` (normally 2). When she ticks one, the next one moves up. Below that, a
-   "Want to do more?" section shows the following items of `queue`. Extra work
-   done today counts toward the week, so later days get lighter.
+1. **Today screen = a queue.** Show `today.blouseIds` (normally 2, or one full-day
+   piece). When she ticks one, the next one moves up. Below that, a "Want to do more?"
+   section shows the following items of `queue`. Extra work done today counts toward
+   the week, so later days get lighter.
 2. **Tick with the right date.** `doneDate` must be the day she actually stitched.
    On the first open of each day, if the previous working day's list (save
    `today.blouseIds` each evening) still has unticked blouses, ask: *"Did you
@@ -102,9 +108,8 @@ Every call takes an `EngineInput`:
 
 ## Known limits
 
-- Every blouse counts as the same amount of work. A heavy/bridal blouse that takes
-  2–3× longer will get a date that is too early. Possible later fix: an effort
-  weight per blouse type.
+- Apart from full-day pieces, every piece counts as the same amount of work. A
+  heavy/bridal blouse that takes 2–3× longer will get a date that is too early.
 - A quote is valid for the moment it is given. Only one person uses the phone, so
   this is fine.
 

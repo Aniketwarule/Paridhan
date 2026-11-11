@@ -27,6 +27,7 @@ const settings: AppSettings = {
   weekStartsOn: 1,
   priceAstar: 300,
   priceDesigner: 400,
+  rates: { dress: 500 },
 };
 
 const MONDAY = '2026-11-02';
@@ -59,6 +60,7 @@ describe('toEngineInput', () => {
     expect(input.blouses.map(b => [b.id, b.partId, b.status])).toEqual([['9', '5', 'scheduled'], ['10', '5', 'done']]);
     expect(input.settings.daysOff).toEqual(['2026-11-04']);
     expect(input.settings).not.toHaveProperty('priceAstar');
+    expect(input.settings).not.toHaveProperty('rates');
   });
 
   it('drops a stale doneDate on a blouse that was un-ticked', () => {
@@ -100,6 +102,17 @@ describe('schedule through the bridge', () => {
     expect(strip).toHaveLength(5);
     expect(strip[0]).toMatchObject({ weekStart: MONDAY, capacity: 10 });
     expect(strip.reduce((n, w) => n + w.used, 0)).toBe(3);
+  });
+
+  it('gives a nav-vari its own day and counts that whole day in the week strip', () => {
+    const input = toEngineInput(MONDAY, settings, [], data(
+      [part(5, '2026-11-20')],
+      [blouse(1, 5, { type: 'navvari' }), blouse(2, 5), blouse(3, 5, { type: 'navvari', status: 'done', doneDate: '2026-11-01' })],
+    ));
+    const s = rebuildSchedule(input);
+    expect(s.today.blouseIds).toEqual(['1']);
+    expect(s.days[1]).toEqual({ date: '2026-11-03', blouseIds: ['2'] });
+    expect(weekStrip(input, s)[0].used).toBe(3);
   });
 
   it('counts week extras in the strip capacity', () => {

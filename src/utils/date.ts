@@ -25,6 +25,13 @@ export function fmt(date?: string | null): string {
   return `${d}/${m}/${y}`;
 }
 
+/** "05/11/2026, 3:45 PM" on the device's clock. */
+export function fmtDateTime(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const hours = d.getHours();
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}, ${hours % 12 || 12}:${pad(d.getMinutes())} ${hours < 12 ? 'AM' : 'PM'}`;
+}
+
 /** "Thu 05/11" */
 export function fmtShort(date?: string | null): string {
   if (!date) return '—';
@@ -45,6 +52,9 @@ export function fmtRelative(date: string, today: string): string {
   if (date === addDays(today, 1)) return STRINGS.tomorrow;
   return fmtShort(date);
 }
+
+/** Whole days from `from` to `to`. */
+export const daysBetween = (from: string, to: string) => toDay(to) - toDay(from);
 
 /** Monday-based (or weekStartsOn-based) week range containing `date`, shifted by `offset` weeks. */
 export function weekRange(date: string, weekStartsOn: number, offset = 0): [string, string] {

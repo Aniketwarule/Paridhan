@@ -1,8 +1,9 @@
 // ============================================================
 // Poshakh – Today Screen
-// Today's list is the top of the engine's work queue. Below it, the plan
-// for the next six days (she can stitch those early). A search finds any
-// open blouse she stitched outside the list.
+// Today's list is the engine's plan for today, one group per customer delivery.
+// Then what is waiting to be handed over, then the coming six days folded up
+// (she can stitch those early). A search finds any open work she stitched
+// outside the list.
 // ============================================================
 import React, { useEffect, useMemo, useState } from 'react';
 import {
@@ -15,8 +16,10 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TouchableOpacity,
   View,
 } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { STRINGS } from '../strings';
@@ -24,7 +27,7 @@ import { useAppContext } from '../context/AppContext';
 import * as DB from '../db/database';
 import { addDays, catchUpExtra, toDay, weekdayOf } from '../engine';
 import type { CatchUp } from '../engine';
-import type { BlouseView } from '../types';
+import type { BlouseView, SmallWork } from '../types';
 import {
   Actions,
   Button,
@@ -42,26 +45,37 @@ import {
   SPACE,
   Tag,
 } from '../components/ui';
-import { fmt, fmtLong, fmtRelative, fmtShort } from '../utils/date';
-import { blouseLabel } from '../utils/labels';
+import { daysBetween, fmt, fmtLong, fmtRelative, fmtShort } from '../utils/date';
+import { blouseLabel, workSummary } from '../utils/labels';
+import { collectOnDelivery, partAmounts } from '../utils/order';
 
 /** The list she saw on a day, so the next day we can ask about unticked ones. */
 interface SavedList { date: string; ids: number[] }
 const LIST_KEY = 'todayList';
 const DAYS_AHEAD = 6;
+/** Remind her about a backup after this many days. */
+const BACKUP_REMINDER_DAYS = 7;
+
+/** One group per delivery, in the order the pieces come. */
+function groupByPart(pieces: BlouseView[]): BlouseView[][] {
+  const groups = new Map<number, BlouseView[]>();
+  for (const p of pieces) groups.set(p.partId, [...(groups.get(p.partId) ?? []), p]);
+  return [...groups.values()];
+}
 
 export function TodayScreen() {
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation<any>();
   const {
     isReady, today, settings, daysOff, schedule, version, late, willMiss, buildInput, refresh,
   } = useAppContext();
   const [searchOpen, setSearchOpen] = useState(false);
+  const [openDay, setOpenDay] = useState<string | null>(null);
 
-  const queue = useMemo(() => schedule.queue.map(Number), [schedule]);
-  const left = Math.max(0, schedule.todayTarget - schedule.doneTodayCount);
-  const todayIds = queue.slice(0, left);
+  // The engine's plan for today, so a nav-vari gets the day to itself.
+  const todayIds = useMemo(() => schedule.today.blouseIds.map(Number), [schedule]);
 
-  // Next six calendar days with their planned blouses.
+  // Next six calendar days with their planned work.
   const ahead = useMemo(() => {
     const byDate = new Map(schedule.days.map(d => [d.date, d.blouseIds.map(Number)]));
     const off = new Set(daysOff.map(d => d.date));
@@ -88,7 +102,16 @@ export function TodayScreen() {
         return v && v.status === 'scheduled' && !v.partDeliveredOn;
       })
       : [];
-    return { doneToday, views, ready: DB.loadReadyParts(), saved, unticked };
+    const small = DB.loadSmallWorkByPart([...new Set([...views.values()].map(v => v.partId))]);
+    const ready = DB.loadReadyParts().map(p => {
+      const card = DB.loadOrderDetails(p.orderId);
+      return { ...p, collect: card ? collectOnDelivery(card, p.id) : 0 };
+    });
+    const lastBackup = DB.getLastBackup();
+    return {
+      doneToday, views, small, ready, saved, unticked, lastBackup,
+      remindBackup: DB.hasOrders() && (!lastBackup || daysBetween(lastBackup, today) >= BACKUP_REMINDER_DAYS),
+    };
     // `version` changes after every DB write: reload then.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, version, ahead]);
@@ -108,6 +131,7 @@ export function TodayScreen() {
 
   if (!isReady || !data) return <Loading />;
   const view = (id: number) => data.views.get(id);
+  const viewsOf = (ids: number[]) => ids.map(view).filter((v): v is BlouseView => !!v);
 
   // ── Actions ──────────────────────────────────────────────────
   const markDone = (ids: number[], date = today) => { DB.markBlousesDone(ids, date); refresh(); };
@@ -118,29 +142,43 @@ export function TodayScreen() {
     refresh();
   };
 
-  const deliver = (partId: number, name: string) => {
-    Alert.alert(STRINGS.todayDeliverConfirm, name, [
+  const deliver = (partId: number, name: string, collect: number) => {
+    const money = collect > 0 ? STRINGS.todayCollect(collect) : STRINGS.todayNothingToCollect;
+    Alert.alert(STRINGS.todayDeliverConfirm, `${name}\n${money}`, [
       { text: STRINGS.cancel, style: 'cancel' },
       { text: STRINGS.todayMarkDelivered, onPress: () => { DB.setPartDelivered(partId, today); refresh(); } },
     ]);
   };
 
   // Will-miss parts, one row per customer delivery.
-  const missParts = new Map<number, BlouseView[]>();
-  for (const id of schedule.willMiss.map(Number)) {
-    const v = view(id);
-    if (!v) continue;
-    missParts.set(v.partId, [...(missParts.get(v.partId) ?? []), v]);
-  }
+  const missParts = groupByPart(viewsOf(schedule.willMiss.map(Number)));
 
   const yesterdayDate = data.saved?.date ?? '';
   const rows = (ids: number[], render: (v: BlouseView) => React.ReactNode) =>
-    ids.map(id => view(id)).filter((v): v is BlouseView => !!v).map((v, i) => (
+    viewsOf(ids).map((v, i) => (
       <View key={v.id}>
         {i > 0 && <Separator />}
         {render(v)}
       </View>
     ));
+
+  /** Today's or a coming day's work, one group per customer delivery. */
+  const groups = (ids: number[]) => groupByPart(viewsOf(ids)).map((pieces, i) => (
+    <View key={pieces[0].partId}>
+      {i > 0 && <Separator />}
+      <WorkGroup
+        pieces={pieces}
+        small={data.small.get(pieces[0].partId) ?? []}
+        late={late}
+        willMiss={willMiss}
+        onDone={id => markDone([id])}
+      />
+    </View>
+  ));
+
+  const backupMessage = data.lastBackup
+    ? STRINGS.todayBackupOld(daysBetween(data.lastBackup, today))
+    : STRINGS.todayBackupNever;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -152,19 +190,19 @@ export function TodayScreen() {
       <ScrollView contentContainerStyle={styles.content}>
 
         {/* Will miss: the serious warning, on top */}
-        {missParts.size > 0 && (
+        {missParts.length > 0 && (
           <Section
-            title={`⚠ ${STRINGS.todayWillMissTitle(schedule.willMiss.length)}`}
+            title={`⚠ ${STRINGS.todayWillMissTitle}`}
             subtitle={STRINGS.todayWillMissHint}
             accent={COLORS.danger}
           >
-            {[...missParts.values()].map((bs, i) => (
+            {missParts.map((bs, i) => (
               <View key={bs[0].partId}>
                 {i > 0 && <Separator />}
                 <Row style={styles.listRow}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.name}>{bs[0].customerName}</Text>
-                    <Text style={styles.sub}>{STRINGS.blouses(bs.length)} · {STRINGS.ordersDeliverBy(fmt(bs[0].promisedDelivery))}</Text>
+                    <Text style={styles.sub}>{workSummary(bs)} · {STRINGS.ordersDeliverBy(fmt(bs[0].promisedDelivery))}</Text>
                   </View>
                   {bs[0].customerPhone ? (
                     <Button
@@ -181,7 +219,7 @@ export function TodayScreen() {
           </Section>
         )}
 
-        {/* Yesterday's unticked blouses */}
+        {/* Yesterday's unticked work */}
         {data.unticked.length > 0 && (
           <Section title={STRINGS.todayYesterdayTitle(fmtShort(yesterdayDate))} accent={COLORS.warning}>
             {rows(data.unticked, v => (
@@ -203,7 +241,7 @@ export function TodayScreen() {
         {/* Late: quiet note + catch-up offer */}
         {schedule.late.length > 0 && (
           <Section accent={COLORS.textMuted}>
-            <Text style={styles.lateText}>{STRINGS.todayLateNote(schedule.late.length)}</Text>
+            <Text style={styles.lateText}>{STRINGS.todayLateNote}</Text>
             {catchUp && (
               <Row style={styles.listRow}>
                 <Text style={[styles.lateText, styles.catchUpText]}>
@@ -230,62 +268,104 @@ export function TodayScreen() {
           accent={COLORS.accent}
         >
           {todayIds.length === 0 && <EmptyState message={STRINGS.todayNothingToday} />}
-          {rows(todayIds, v => (
-            <BlouseRow item={v} late={late.has(v.id)} willMiss={willMiss.has(v.id)} onDone={() => markDone([v.id])} />
-          ))}
+          {groups(todayIds)}
           {data.doneToday.length > 0 && (
             <>
               <Separator inset={0} />
-              {rows(data.doneToday, v => <BlouseRow item={v} done onUndo={() => undo(v.id)} />)}
+              {groupByPart(viewsOf(data.doneToday)).map((pieces, i) => (
+                <View key={pieces[0].partId}>
+                  {i > 0 && <Separator />}
+                  <WorkGroup pieces={pieces} small={[]} done onUndo={undo} />
+                </View>
+              ))}
             </>
           )}
         </Section>
 
-        {/* Next six days */}
-        <Text style={styles.aheadHint}>{STRINGS.todayAheadHint}</Text>
-        {ahead.map(day => (
-          <Section
-            key={day.date}
-            title={fmtRelative(day.date, today)}
-            subtitle={fmtLong(day.date)}
-            count={day.ids.length || undefined}
-          >
-            {day.ids.length === 0 ? (
-              <Text style={styles.dayEmpty}>{day.working ? STRINGS.todayNothingPlanned : STRINGS.todayNoStitchDay}</Text>
-            ) : rows(day.ids, v => (
-              <BlouseRow item={v} late={late.has(v.id)} willMiss={willMiss.has(v.id)} onDone={() => markDone([v.id])} />
-            ))}
-          </Section>
-        ))}
-
-        {/* Ready to deliver (one row per delivery) */}
+        {/* To hand over (one row per delivery) */}
         {data.ready.length > 0 && (
           <Section title={STRINGS.todayReadyToDeliver} count={data.ready.length} accent={COLORS.success}>
             {data.ready.map((p, i) => {
-              const total = p.blouses.reduce((s, b) => s + b.price, 0);
-              const paid = p.blouses.every(b => b.paid);
+              const paid = partAmounts(p).every(a => a.paid);
               return (
                 <View key={p.id}>
                   {i > 0 && <Separator />}
                   <View style={styles.listRow}>
                     <Text style={styles.name}>{p.customerName}</Text>
-                    <Text style={styles.sub}>
-                      {STRINGS.blouses(p.blouses.length)} · ₹{total} · {STRINGS.ordersDeliverBy(fmt(p.promisedDelivery))}
+                    <Text style={styles.sub}>{workSummary(p.blouses, p.smallWork)}</Text>
+                    <Text style={styles.small}>{STRINGS.ordersDeliverBy(fmt(p.promisedDelivery))}</Text>
+                    <Text style={[styles.collect, p.collect === 0 && styles.collectNone]}>
+                      {p.collect > 0 ? STRINGS.todayCollect(p.collect) : STRINGS.todayNothingToCollect}
                     </Text>
                     <Actions row style={styles.rowActions}>
-                      <Button label={STRINGS.todayMarkDelivered} icon="checkmark-done" size="small" onPress={() => deliver(p.id, p.customerName)} />
                       <Button
-                        label={paid ? STRINGS.todayPaid : STRINGS.todayMarkPaid}
-                        icon={paid ? undefined : 'cash-outline'}
+                        label={STRINGS.todayMarkDelivered}
+                        icon="checkmark-done"
                         size="small"
-                        variant={paid ? 'success' : 'secondary'}
-                        onPress={() => { DB.setPartPaid(p.id, !paid); refresh(); }}
+                        onPress={() => deliver(p.id, p.customerName, p.collect)}
                       />
+                      {(paid || p.collect > 0) && (
+                        <Button
+                          label={paid ? STRINGS.todayPaid : STRINGS.todayMarkPaid}
+                          icon={paid ? undefined : 'cash-outline'}
+                          size="small"
+                          variant={paid ? 'success' : 'secondary'}
+                          onPress={() => { DB.setPartPaid(p.id, !paid); refresh(); }}
+                        />
+                      )}
                     </Actions>
                   </View>
                 </View>
               );
             })}
+          </Section>
+        )}
+
+        {/* Coming days, folded up: tap a day to see its work */}
+        <Section title={STRINGS.todayComingDays} subtitle={STRINGS.todayAheadHint}>
+          {ahead.map((day, i) => {
+            const pieces = viewsOf(day.ids);
+            const hasWork = pieces.length > 0;
+            const open = hasWork && openDay === day.date;
+            const fullDay = pieces.some(p => p.type === 'navvari');
+            return (
+              <View key={day.date}>
+                {i > 0 && <Separator inset={0} />}
+                <TouchableOpacity
+                  style={styles.dayRow}
+                  disabled={!hasWork}
+                  activeOpacity={0.7}
+                  onPress={() => setOpenDay(o => (o === day.date ? null : day.date))}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.dayTitle, !hasWork && styles.dayTitleEmpty]}>{fmtRelative(day.date, today)}</Text>
+                    <Text style={styles.small}>
+                      {hasWork
+                        ? `${workSummary(pieces)}${fullDay ? ` · ${STRINGS.fullDay}` : ''}`
+                        : day.working ? STRINGS.todayNothingPlanned : STRINGS.todayNoStitchDay}
+                    </Text>
+                  </View>
+                  {hasWork && <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={22} color={COLORS.textMuted} />}
+                </TouchableOpacity>
+                {open && <View style={styles.dayOpen}>{groups(day.ids)}</View>}
+              </View>
+            );
+          })}
+        </Section>
+
+        {/* Everything lives only on this phone */}
+        {data.remindBackup && (
+          <Section accent={COLORS.warning}>
+            <Text style={styles.lateText}>{backupMessage}</Text>
+            <Actions>
+              <Button
+                label={STRINGS.settingsExportDB}
+                icon="cloud-upload-outline"
+                size="small"
+                variant="secondary"
+                onPress={() => navigation.navigate('Settings')}
+              />
+            </Actions>
           </Section>
         )}
       </ScrollView>
@@ -301,43 +381,69 @@ export function TodayScreen() {
   );
 }
 
-// ── One blouse in a list ──────────────────────────────────────
-function BlouseRow({
-  item, late, willMiss, done, plannedOn, onDone, onUndo,
+// ── One customer delivery in a list ───────────────────────────
+function WorkGroup({
+  pieces, small, late, willMiss, done, onDone, onUndo,
 }: {
-  item: BlouseView;
-  late?: boolean;
-  willMiss?: boolean;
+  pieces: BlouseView[];
+  /** Small work on this delivery, so it isn't forgotten. */
+  small: SmallWork[];
+  late?: Set<number>;
+  willMiss?: Set<number>;
   done?: boolean;
-  plannedOn?: string | null;
-  onDone?: () => void;
-  onUndo?: () => void;
+  onDone?: (id: number) => void;
+  onUndo?: (id: number) => void;
 }) {
+  const first = pieces[0];
+  const missing = pieces.some(p => willMiss?.has(p.id));
+  const isLate = pieces.some(p => late?.has(p.id));
   return (
-    <Row style={[styles.listRow, done && { opacity: 0.55 }]}>
+    <View style={[styles.listRow, done && { opacity: 0.55 }]}>
+      <Text style={[styles.name, done && styles.doneText]}>{done ? '✓ ' : ''}{first.customerName}</Text>
+      <Text style={styles.small}>{STRINGS.ordersDeliverBy(fmt(first.promisedDelivery))}</Text>
+      {!done && (first.priority === 'emergency' || missing || isLate) && (
+        <Row style={{ flexWrap: 'wrap' }}>
+          {first.priority === 'emergency' && <Tag label={STRINGS.emergency} color={COLORS.emergency} />}
+          {missing ? <Tag label={STRINGS.todayWillMiss} color={COLORS.danger} />
+            : isLate ? <Tag label={STRINGS.todayMightBeLate} color={COLORS.textMuted} /> : null}
+        </Row>
+      )}
+      {pieces.map(p => (
+        <Row key={p.id} style={styles.pieceRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.piece}>{blouseLabel(p)}</Text>
+            {p.type === 'navvari' && <Tag label={STRINGS.fullDay} color={COLORS.tagGeneral} />}
+          </View>
+          {done
+            ? <Button label={STRINGS.undo} size="small" variant="secondary" onPress={() => onUndo?.(p.id)} />
+            : <Button label={STRINGS.todayMarkDone} icon="checkmark" size="small" onPress={() => onDone?.(p.id)} />}
+        </Row>
+      ))}
+      {small.length > 0 && <Text style={styles.smallNote}>+ {workSummary([], small)}</Text>}
+    </View>
+  );
+}
+
+// ── One piece in the search results ───────────────────────────
+function SearchRow({
+  item, plannedOn, onDone,
+}: { item: BlouseView; plannedOn?: string | null; onDone: () => void }) {
+  return (
+    <Row style={styles.listRow}>
       <View style={styles.rowMain}>
-        <Text style={[styles.name, done && styles.doneText]}>
-          {done ? '✓ ' : ''}{item.customerName}
-        </Text>
-        <Text style={styles.sub}>{blouseLabel(item)} · ₹{item.price}</Text>
+        <Text style={styles.name}>{item.customerName}</Text>
+        <Text style={styles.sub}>{blouseLabel(item)}</Text>
         <Text style={styles.small}>
           {STRINGS.ordersDeliverBy(fmt(item.promisedDelivery))}
           {plannedOn ? `  ·  ${STRINGS.todayPlannedOn(fmtShort(plannedOn))}` : ''}
         </Text>
-        <Row style={{ flexWrap: 'wrap' }}>
-          {item.priority === 'emergency' && <Tag label={STRINGS.emergency} color={COLORS.emergency} />}
-          {willMiss ? <Tag label={STRINGS.todayWillMiss} color={COLORS.danger} />
-            : late ? <Tag label={STRINGS.todayMightBeLate} color={COLORS.textMuted} /> : null}
-        </Row>
       </View>
-      {done
-        ? <Button label={STRINGS.undo} size="small" variant="secondary" onPress={onUndo ?? (() => {})} />
-        : <Button label={STRINGS.todayMarkDone} icon="checkmark" size="small" onPress={onDone ?? (() => {})} />}
+      <Button label={STRINGS.todayMarkDone} icon="checkmark" size="small" onPress={onDone} />
     </Row>
   );
 }
 
-// ── Search any open blouse ────────────────────────────────────
+// ── Search any open work ──────────────────────────────────────
 function SearchModal({
   visible, stitchDate, version, onClose, onDone,
 }: {
@@ -378,12 +484,12 @@ function SearchModal({
             </View>
           </ModalHeader>
           <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-            <Text style={styles.aheadHint}>{STRINGS.todaySearchHint}</Text>
+            <Text style={styles.searchHint}>{STRINGS.todaySearchHint}</Text>
             <Section>
               {results.length === 0 ? <EmptyState message={STRINGS.todaySearchEmpty} /> : results.map((v, i) => (
                 <View key={v.id}>
                   {i > 0 && <Separator />}
-                  <BlouseRow item={v} plannedOn={stitchDate[String(v.id)]} onDone={() => onDone(v.id)} />
+                  <SearchRow item={v} plannedOn={stitchDate[String(v.id)]} onDone={() => onDone(v.id)} />
                 </View>
               ))}
             </Section>
@@ -406,13 +512,17 @@ const styles = StyleSheet.create({
   doneText: { textDecorationLine: 'line-through' },
   sub: { fontSize: FONT.size, color: COLORS.textSecondary, marginTop: 2 },
   small: { fontSize: FONT.sizeSmall, color: COLORS.textMuted, marginTop: 2 },
+  pieceRow: { gap: SPACE.sm, marginTop: SPACE.sm },
+  piece: { fontSize: FONT.size, color: COLORS.text, fontWeight: FONT.weightMedium },
+  smallNote: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, marginTop: SPACE.sm },
+  collect: { fontSize: FONT.size, fontWeight: FONT.weightBold, color: COLORS.text, marginTop: SPACE.xs },
+  collectNone: { fontWeight: FONT.weightMedium, color: COLORS.success },
   lateText: { fontSize: FONT.size, color: COLORS.textSecondary, paddingHorizontal: LAYOUT.inset, paddingTop: SPACE.sm },
-  /** Note between panels: sits in the gutter, just above the next panel. */
-  aheadHint: {
-    fontSize: FONT.sizeSmall, color: COLORS.textSecondary,
-    paddingHorizontal: LAYOUT.inset, marginTop: LAYOUT.sectionGap, marginBottom: -SPACE.sm,
-  },
-  dayEmpty: { fontSize: FONT.size, color: COLORS.textMuted, paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
+  dayRow: { flexDirection: 'row', alignItems: 'center', gap: SPACE.sm, paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
+  dayTitle: { fontSize: FONT.size, fontWeight: FONT.weightBold, color: COLORS.text },
+  dayTitleEmpty: { fontWeight: FONT.weightMedium, color: COLORS.textSecondary },
+  dayOpen: { backgroundColor: COLORS.brandTint },
+  searchHint: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, paddingHorizontal: LAYOUT.inset, marginTop: LAYOUT.sectionGap, marginBottom: -SPACE.sm },
   searchBox: {
     flex: 1, flexDirection: 'row', alignItems: 'center', gap: SPACE.sm, paddingHorizontal: SPACE.md,
     borderRadius: LAYOUT.radius, backgroundColor: COLORS.bgInput, borderWidth: 1, borderColor: COLORS.border,

@@ -5,12 +5,17 @@
 // Spacing and buttons follow .claude/skills/poshakh-ui/SKILL.md:
 // use SPACE / LAYOUT, <Button> and <Actions>, never hand-rolled values.
 // ============================================================
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  Keyboard,
+  LayoutChangeEvent,
   Modal,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -75,6 +80,8 @@ export const COLORS = {
   warningBg: '#FFF4E5',
   success: '#27AE60',
   successBg: '#E8F6EE',
+  /** Light blue, for neutral information boxes. */
+  infoBg: '#EAF2FB',
   emergency: '#8B0000',
   tagGeneral: '#2F6FB7',
 };
@@ -187,6 +194,52 @@ export function Actions({
   );
 }
 
+// ── Keyboard ──────────────────────────────────────────────────
+/** True while the on-screen keyboard is open. */
+export function useKeyboardVisible(): boolean {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const a = Keyboard.addListener('keyboardDidShow', () => setShown(true));
+    const b = Keyboard.addListener('keyboardDidHide', () => setShown(false));
+    return () => { a.remove(); b.remove(); };
+  }, []);
+  return shown;
+}
+
+/**
+ * Brings the box being typed in above the keyboard. Some Android phones don't move the screen
+ * for the keyboard by themselves, so the box she tapped would stay hidden under it.
+ * Spread the result onto the ScrollView: `<ScrollView ref={ref} {...keepVisible}>`.
+ */
+export function useKeepInputVisible(scrollRef: React.RefObject<React.ComponentRef<typeof ScrollView> | null>) {
+  const height = useRef(0);
+  const offset = useRef(0);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const sub = Keyboard.addListener('keyboardDidShow', () => {
+      // Wait for the screen to make room for the keyboard first.
+      timer = setTimeout(() => {
+        const input = TextInput.State.currentlyFocusedInput();
+        const scroll = scrollRef.current;
+        const content = scroll?.getInnerViewRef();
+        if (!input || !scroll || !content) return;
+        input.measureLayout(content, (_x, y, _w, h) => {
+          const top = offset.current;
+          const bottom = top + height.current - SPACE.sm;
+          if (y >= top && y + h <= bottom) return;
+          scroll.scrollTo({ y: Math.max(0, y + h - height.current + SPACE.xxl), animated: true });
+        }, () => {});
+      }, 250);
+    });
+    return () => { sub.remove(); if (timer) clearTimeout(timer); };
+  }, [scrollRef]);
+  return {
+    onLayout: (e: LayoutChangeEvent) => { height.current = e.nativeEvent.layout.height; },
+    onScroll: (e: NativeSyntheticEvent<NativeScrollEvent>) => { offset.current = e.nativeEvent.contentOffset.y; },
+    scrollEventThrottle: 32,
+  };
+}
+
 // ── Card ──────────────────────────────────────────────────────
 export function Card({ children, style }: { children: React.ReactNode; style?: StyleProp<ViewStyle> }) {
   return <View style={[styles.card, style]}>{children}</View>;
@@ -227,6 +280,44 @@ export function Section({
 /** Thin line between rows inside a Section. */
 export function Separator({ inset = LAYOUT.inset }: { inset?: number }) {
   return <View style={[styles.separator, { marginLeft: inset }]} />;
+}
+
+/**
+ * A tappable row that opens something (a settings page, a detail): round icon, title,
+ * one line saying what is set now, and a chevron. Put it inside a Section, with <Separator /> between rows.
+ */
+export function ListRow({
+  icon, title, subtitle, onPress, warn, right,
+}: {
+  icon: IconName;
+  title: string;
+  subtitle?: string;
+  onPress?: () => void;
+  /** Subtitle in warning colour: something here needs her attention. */
+  warn?: boolean;
+  /** Replaces the chevron, e.g. a switch. */
+  right?: React.ReactNode;
+}) {
+  const body = (
+    <>
+      <View style={[styles.listIcon, warn && { backgroundColor: COLORS.warningBg }]}>
+        <Ionicons name={icon} size={22} color={warn ? COLORS.warning : COLORS.accent} />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={styles.listTitle}>{title}</Text>
+        {subtitle ? (
+          <Text style={[styles.listSubtitle, warn && { color: COLORS.warning }]} numberOfLines={2}>{subtitle}</Text>
+        ) : null}
+      </View>
+      {right ?? (onPress ? <Ionicons name="chevron-forward" size={22} color={COLORS.textMuted} /> : null)}
+    </>
+  );
+  if (!onPress) return <View style={styles.listRow}>{body}</View>;
+  return (
+    <TouchableOpacity style={styles.listRow} onPress={onPress} activeOpacity={0.6} accessibilityRole="button">
+      {body}
+    </TouchableOpacity>
+  );
 }
 
 /** Section header used outside a panel (kept for small labels). */
@@ -370,6 +461,66 @@ export function Checkbox({
   );
 }
 
+// ── Work tiles (New Order) ────────────────────────────────────
+/** Two big tiles per row. */
+export function TileGrid({ children }: { children: React.ReactNode }) {
+  return <View style={styles.tileGrid}>{children}</View>;
+}
+
+/** Tap to add one. Shows how many are already in the order (or a tick when `selected`, in a picker). */
+export function WorkTile({
+  label, note, count, onPress, selected,
+}: { label: string; note?: string; count: number; onPress: () => void; selected?: boolean }) {
+  return (
+    <TouchableOpacity
+      style={[styles.tile, (count > 0 || selected) && styles.tileOn]}
+      onPress={onPress}
+      activeOpacity={0.7}
+      accessibilityRole="button"
+      accessibilityLabel={count > 0 ? `${label}, ${count}` : label}
+    >
+      <View style={{ flex: 1 }}>
+        <Text style={styles.tileLabel}>{label}</Text>
+        {note ? <Text style={styles.tileNote}>{note}</Text> : null}
+      </View>
+      {selected
+        ? <Ionicons name="checkmark-circle" size={24} color={COLORS.accent} />
+        : count > 0
+          ? <View style={styles.countPill}><Text style={styles.countText}>{count}</Text></View>
+          : <Ionicons name="add-circle-outline" size={24} color={COLORS.accent} />}
+    </TouchableOpacity>
+  );
+}
+
+/** − 3 +. At 1 the minus becomes a bin: going to 0 means remove. */
+export function Stepper({
+  value, onChange, removeLabel,
+}: { value: number; onChange: (n: number) => void; removeLabel: string }) {
+  return (
+    <Row style={styles.stepper}>
+      <TouchableOpacity
+        style={styles.stepperBtn}
+        onPress={() => onChange(value - 1)}
+        hitSlop={SPACE.xs}
+        accessibilityRole="button"
+        accessibilityLabel={value === 1 ? removeLabel : '−'}
+      >
+        <Ionicons name={value === 1 ? 'trash-outline' : 'remove'} size={20} color={value === 1 ? COLORS.danger : COLORS.accent} />
+      </TouchableOpacity>
+      <Text style={styles.stepperValue}>{value}</Text>
+      <TouchableOpacity
+        style={styles.stepperBtn}
+        onPress={() => onChange(value + 1)}
+        hitSlop={SPACE.xs}
+        accessibilityRole="button"
+        accessibilityLabel="+"
+      >
+        <Ionicons name="add" size={20} color={COLORS.accent} />
+      </TouchableOpacity>
+    </Row>
+  );
+}
+
 // ── NumericTextInput ──────────────────────────────────────────
 // Keeps a string draft while focused so users can clear, type 0,
 // or replace a digit without the previous number snapping back.
@@ -461,19 +612,21 @@ interface NumberInputProps extends Omit<TextInputProps, 'onChangeText' | 'value'
   onChangeValue: (n: number) => void;
   min?: number;
   max?: number;
+  /** Label and box on one line, for lists of numbers. */
+  inline?: boolean;
 }
 
-export function NumberInput({ label, value, onChangeValue, min = 0, max, ...rest }: NumberInputProps) {
+export function NumberInput({ label, value, onChangeValue, min = 0, max, inline, ...rest }: NumberInputProps) {
   return (
-    <View style={styles.inputRow}>
-      <Text style={styles.label}>{label}</Text>
+    <View style={[styles.inputRow, inline && styles.inputInline]}>
+      <Text style={[styles.label, inline && styles.labelInline]}>{label}</Text>
       <NumericTextInput
         value={value}
         onChangeValue={onChangeValue}
         min={min}
         max={max}
         {...rest}
-        style={[styles.numInput, rest.style]}
+        style={[styles.numInput, inline && styles.numInputInline, rest.style]}
       />
     </View>
   );
@@ -729,6 +882,10 @@ const styles = StyleSheet.create({
   countPill: { minWidth: 28, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 14, backgroundColor: COLORS.accent, alignItems: 'center' },
   countText: { color: '#fff', fontSize: FONT.sizeSmall, fontWeight: FONT.weightBold },
   separator: { height: 1, backgroundColor: COLORS.separator },
+  listRow: { flexDirection: 'row', alignItems: 'center', gap: SPACE.md, paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY, minHeight: 64 },
+  listIcon: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.brandTint },
+  listTitle: { fontSize: FONT.size, fontWeight: FONT.weightMedium, color: COLORS.text },
+  listSubtitle: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, marginTop: 2 },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: LAYOUT.inset, paddingTop: SPACE.lg, paddingBottom: SPACE.xs },
   sectionHeaderTitle: { fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.text, flex: 1 },
   sectionHeaderCount: { fontSize: FONT.size, color: COLORS.textMuted },
@@ -796,10 +953,30 @@ const styles = StyleSheet.create({
   segmentOn: { backgroundColor: COLORS.accent },
   segmentText: { fontSize: FONT.size, color: COLORS.textSecondary, fontWeight: FONT.weightMedium },
   segmentTextOn: { color: '#fff', fontWeight: FONT.weightBold },
+  tileGrid: {
+    flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: SPACE.sm,
+    paddingHorizontal: LAYOUT.inset, paddingVertical: SPACE.xs,
+  },
+  tile: {
+    width: '48.5%', minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: SPACE.sm,
+    padding: SPACE.md, borderRadius: LAYOUT.radius, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.bg,
+  },
+  tileOn: { borderColor: COLORS.brand, backgroundColor: COLORS.brandTint },
+  tileLabel: { fontSize: FONT.size, fontWeight: FONT.weightMedium, color: COLORS.text },
+  tileNote: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, marginTop: 2 },
+  stepper: { gap: SPACE.xs },
+  stepperBtn: {
+    width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.bg,
+  },
+  stepperValue: { minWidth: 28, textAlign: 'center', fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.text },
   checkRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8 },
   checkLabel: { fontSize: FONT.size, color: COLORS.text },
   inputRow: { marginVertical: SPACE.sm, paddingHorizontal: LAYOUT.inset },
+  inputInline: { flexDirection: 'row', alignItems: 'center', gap: SPACE.md },
   label: { fontSize: FONT.size, color: COLORS.text, marginBottom: 6, fontWeight: FONT.weightMedium },
+  labelInline: { flex: 1, marginBottom: 0 },
+  numInputInline: { width: 96, textAlign: 'right' },
   numInput: {
     borderWidth: 1,
     borderColor: COLORS.border,

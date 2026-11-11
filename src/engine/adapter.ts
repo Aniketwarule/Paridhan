@@ -28,7 +28,7 @@ export interface EngineData {
 }
 
 export function toEngineSettings(s: AppSettings, daysOff: string[]): Settings {
-  const { priceAstar: _a, priceDesigner: _d, ...engine } = s;
+  const { priceAstar: _a, priceDesigner: _d, rates: _r, ...engine } = s;
   return normalizeSettings({ ...engine, daysOff });
 }
 
@@ -62,6 +62,7 @@ export function toEngineInput(
       price: b.price,
       status: b.status,
       doneDate: b.status === 'done' ? b.doneDate : undefined,
+      fullDay: b.type === 'navvari',
     })),
     weekExtras: data.weekExtras,
     dayExtras: data.dayExtras,
@@ -99,15 +100,16 @@ export function weekStrip(
     const ws = addDays(first, i * 7);
     bars.set(ws, { weekStart: ws, used: 0, capacity: s.weeklyTarget });
   }
-  const bump = (date: string | null | undefined, key: 'used' | 'capacity', n = 1) => {
-    if (!date) return;
+  for (const [weekStart, used] of Object.entries(schedule.weekLoad)) {
+    const bar = bars.get(weekStart);
+    if (bar) bar.used = used;
+  }
+  const addCapacity = (date: string, n: number) => {
     const bar = bars.get(weekStartOf(date, s.weekStartsOn));
-    if (bar) bar[key] += n;
+    if (bar) bar.capacity += n;
   };
-  for (const b of input.blouses) if (b.status === 'done') bump(b.doneDate, 'used');
-  for (const d of Object.values(schedule.stitchDate)) bump(d, 'used');
-  for (const e of input.weekExtras ?? []) bump(e.weekStart, 'capacity', e.n);
-  for (const e of input.dayExtras ?? []) bump(e.date, 'capacity', e.n);
+  for (const e of input.weekExtras ?? []) addCapacity(e.weekStart, e.n);
+  for (const e of input.dayExtras ?? []) addCapacity(e.date, e.n);
   for (const u of override) {
     const bar = bars.get(u.weekStart);
     if (bar) bar.used = u.used;

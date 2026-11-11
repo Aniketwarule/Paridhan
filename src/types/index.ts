@@ -7,7 +7,16 @@ import type { BlouseStatus, Priority, Settings } from '../engine';
 
 export type { BlouseStatus, Priority } from '../engine';
 
-export type BlouseType = 'astar' | 'designer';
+/**
+ * Stitching work: what the schedule plans. The table and type are still called "blouse",
+ * but a row can also be a dress or a nav-vari saree. 'navvari' takes a whole working day;
+ * the others take one slot.
+ */
+export type BlouseType = 'astar' | 'sadha' | 'designer' | 'dress' | 'navvari';
+/** Small work: only added to the order and the bill, it never uses schedule time. */
+export type SmallWorkKind = 'blouse_alter' | 'dress_alter' | 'parkar_alter' | 'parkar_stitch' | 'piko_fall' | 'piko' | 'other';
+/** Anything she can add to an order. */
+export type WorkKey = BlouseType | SmallWorkKind;
 /** Derived from the order's parts and blouses; never edited by hand. */
 export type OrderStatus = 'pending' | 'ready' | 'delivered' | 'cancelled';
 
@@ -57,6 +66,20 @@ export interface Blouse {
   paid: boolean;
 }
 
+/** Bill-only work on a delivery. Identical pieces share one row with a quantity. */
+export interface SmallWork {
+  id: number;
+  partId: number;
+  orderId: number;
+  kind: SmallWorkKind;
+  /** Her own label; for 'other' this is the name of the work. */
+  name?: string;
+  qty: number;
+  /** Price of one (₹). */
+  price: number;
+  paid: boolean;
+}
+
 export interface CustomerSummary extends Customer {
   lastOrderAt?: string;
   orderCount: number;
@@ -72,6 +95,8 @@ export interface DayOff {
 export interface AppSettings extends Omit<Settings, 'daysOff'> {
   priceAstar: number;
   priceDesigner: number;
+  /** Usual price of every other kind of work; missing means she has not set one yet. */
+  rates: Partial<Record<WorkKey, number>>;
 }
 
 // ----------------------------------------------------------------
@@ -89,6 +114,7 @@ export interface BlouseView extends Blouse {
 
 export interface PartWithBlouses extends OrderPart {
   blouses: Blouse[];
+  smallWork: SmallWork[];
 }
 
 export interface OrderWithDetails {

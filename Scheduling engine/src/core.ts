@@ -24,6 +24,8 @@ export interface WorkItem {
   promised: DayNum;
   createdAt: number;
   open: boolean;
+  /** Takes a whole untouched day on its own. */
+  fullDay: boolean;
 }
 
 export interface Ctx {
@@ -82,19 +84,29 @@ export function makeCtx(input: EngineInput): Ctx {
 
   const orders = new Map(input.orders.map((o) => [o.id, o]));
   const parts = new Map(input.parts.map((p) => [p.id, p]));
-  const doneByWeek = new Map<DayNum, number>();
-  let doneToday = 0;
-  const items: WorkItem[] = [];
+  const ctx: Ctx = {
+    today, settings, W, G,
+    working: new Set(settings.workingWeekdays),
+    delivery: new Set(settings.deliveryWeekdays),
+    daysOff: new Set(settings.daysOff.map(toDay)),
+    extras, dayExtras, dayExtraByWeek,
+    doneByWeek: new Map(),
+    doneToday: 0,
+    items: [],
+    weekCache: new Map(),
+  };
   for (const b of input.blouses) {
     const part = parts.get(b.partId);
     if (!part) throw new Error(`Blouse ${b.id} refers to unknown part ${b.partId}`);
     if (b.status === 'done' && b.doneDate) {
       const d = toDay(b.doneDate);
-      doneByWeek.set(ws(d), (doneByWeek.get(ws(d)) ?? 0) + 1);
-      if (d === today) doneToday++;
+      // A finished full-day piece used up that whole day; on a day off that is nothing.
+      const slots = b.fullDay ? dayTarget(ctx, d, 'W') : 1;
+      ctx.doneByWeek.set(ws(d), (ctx.doneByWeek.get(ws(d)) ?? 0) + slots);
+      if (d === today) ctx.doneToday += slots;
     }
     if (b.status === 'cancelled' || part.cancelled) continue;
-    items.push({
+    ctx.items.push({
       id: b.id,
       partId: part.id,
       priority: part.priority,
@@ -102,17 +114,10 @@ export function makeCtx(input: EngineInput): Ctx {
       createdAt: orders.get(part.orderId)?.createdAt ?? 0,
       // A handed-over part is finished even if a blouse was never ticked off.
       open: b.status === 'scheduled' && !part.deliveredOn,
+      fullDay: !!b.fullDay,
     });
   }
-
-  return {
-    today, settings, W, G,
-    working: new Set(settings.workingWeekdays),
-    delivery: new Set(settings.deliveryWeekdays),
-    daysOff: new Set(settings.daysOff.map(toDay)),
-    extras, dayExtras, dayExtraByWeek, doneByWeek, doneToday, items,
-    weekCache: new Map(),
-  };
+  return ctx;
 }
 
 export const weekOf = (ctx: Ctx, d: DayNum) => weekStartOf(d, ctx.settings.weekStartsOn);

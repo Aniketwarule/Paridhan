@@ -1,18 +1,18 @@
 // ============================================================
 // Poshakh – New Order (3 short steps)
-//   1. Customer  – new, or pick an old one
-//   2. Blouses   – type, optional name, price, emergency tick per blouse
-//   3. Delivery  – engine quote, optional other date (calendar), confirm
+//   1. Customer  – search old customers, or add a new one
+//   2. Work      – tap tiles to add stitching and small work
+//   3. Delivery  – engine quote (or a free date for small work), money, confirm
+// After saving: send the bill or start the next order.
 // ============================================================
 import React, { useMemo, useRef, useState } from 'react';
 import {
-  Alert,
   Keyboard,
   KeyboardAvoidingView,
-  Platform,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -23,13 +23,12 @@ import { useAppContext } from '../context/AppContext';
 import * as DB from '../db/database';
 import { orderNo } from '../utils/order';
 import { addDays, checkDate, quote, quoteBoth, rebuildSchedule, weekStrip } from '../engine';
-import type { DateCheck, PriorPart, Priority, QuotePart, WeekExtra } from '../engine';
-import type { BlouseType, CustomerSummary } from '../types';
+import type { DateCheck, PriorPart, Priority, QuotePart, QuotePartRequest, WeekExtra } from '../engine';
+import type { CustomerSummary, OrderWithDetails, WorkKey } from '../types';
 import {
   Actions,
   Button,
   CapacityStrip,
-  Checkbox,
   COLORS,
   DateField,
   FONT,
@@ -39,24 +38,40 @@ import {
   Row,
   ScreenHeader,
   Section,
-  Segmented,
   Separator,
   SPACE,
+  Stepper,
   Steps,
   Tag,
   TextField,
+  TileGrid,
+  useKeepInputVisible,
+  useKeyboardVisible,
+  WorkTile,
 } from '../components/ui';
+import { OrderBillModal } from '../components/OrderBill';
 import { fmt, fmtLong, fmtShort, isDate, nowIso } from '../utils/date';
-
-interface DraftBlouse {
-  key: number;
-  type: BlouseType;
-  name: string;
-  price: number;
-  /** She typed a price herself: don't overwrite it when the type changes. */
-  priceEdited: boolean;
-  emergency: boolean;
-}
+import { ALTER_KINDS, blouseLabel, isStitchWork, OTHER_SMALL_KINDS, rateFor, smallWorkLabel, STITCH_TYPES, workLabel, workSummary } from '../utils/labels';
+import {
+  addWork,
+  draftGroups,
+  draftParts,
+  draftTotal,
+  emergencyCount,
+  fullDayCount,
+  lineTotal,
+  missingName,
+  pieceNeedsName,
+  quoteRequests,
+  removeLastPiece,
+  smallLines,
+  stitchCount,
+  stitchLines,
+  updatePiece,
+  type DraftGroup,
+  type DraftLine,
+  type DraftPiece,
+} from '../utils/orderDraft';
 
 /** One delivery of the new order, with the date we will promise. */
 interface PlannedPart {
@@ -70,68 +85,83 @@ interface PlannedPart {
   stitchDays: string[];
 }
 
-const PRIORITIES: Priority[] = ['emergency', 'general'];
-/** Stable keys for draft blouse cards. */
-let blouseKey = 0;
 const NO_DATES: Record<Priority, string> = { emergency: '', general: '' };
+/** Old customers listed at a time; the search box finds the rest. */
+const CUSTOMER_ROWS = 10;
+
+const groupLabel = (g: DraftGroup) => (isStitchWork(g.work)
+  ? blouseLabel({ type: g.work, name: g.name || undefined })
+  : smallWorkLabel({ kind: g.work, name: g.name || undefined }));
+
+/** "3 blouses, 1 dress, Piko" for the bar above the Next button. */
+const draftSummary = (lines: DraftLine[]) => workSummary(
+  stitchLines(lines).flatMap(l => l.pieces.map(() => ({ type: l.work }))),
+  draftGroups(smallLines(lines)).map(g => ({ kind: g.work, name: g.name || undefined, qty: g.qty })),
+);
 
 export function NewOrderScreen() {
   const insets = useSafeAreaInsets();
   const { settings, daysOff, today, version, buildInput, refresh } = useAppContext();
   const scrollRef = useRef<React.ComponentRef<typeof ScrollView>>(null);
+  /** Scroll down to the order list once the line just opened has been drawn. */
+  const showListNext = useRef(false);
+  const keepVisible = useKeepInputVisible(scrollRef);
+  const typing = useKeyboardVisible();
 
   const [step, setStep] = useState(0);
 
   // ── Step 1: customer ─────────────────────────────────────────
-  const [mode, setMode] = useState<'new' | 'old'>('new');
+  const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [nameError, setNameError] = useState('');
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<CustomerSummary | null>(null);
 
-  // ── Step 2: blouses ──────────────────────────────────────────
-  const newBlouse = (): DraftBlouse => ({
-    key: ++blouseKey, type: 'astar', name: '', price: settings.priceAstar, priceEdited: false, emergency: false,
-  });
-  const [blouses, setBlouses] = useState<DraftBlouse[]>(() => [newBlouse()]);
+  // ── Step 2: work ─────────────────────────────────────────────
+  const [lines, setLines] = useState<DraftLine[]>([]);
+  const [openLine, setOpenLine] = useState<number | null>(null);
+  const [showErrors, setShowErrors] = useState(false);
 
   // ── Step 3: delivery ─────────────────────────────────────────
   const [customDate, setCustomDate] = useState<Record<Priority, string>>(NO_DATES);
+  const [smallDate, setSmallDate] = useState('');
   const [advance, setAdvance] = useState(0);
   const [previousDue, setPreviousDue] = useState(0);
   const [extras, setExtras] = useState<Partial<Record<Priority, WeekExtra>>>({});
 
+  // ── After saving ─────────────────────────────────────────────
+  const [saved, setSaved] = useState<OrderWithDetails | null>(null);
+  const [billOpen, setBillOpen] = useState(false);
+
   const customers = useMemo(
-    () => (mode === 'old' && !selected ? DB.searchCustomers(query) : []),
+    () => (!adding && !selected ? DB.searchCustomers(query, CUSTOMER_ROWS) : []),
     // `version` changes after every DB write: reload then.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [mode, selected, query, version],
+    [adding, selected, query, version],
   );
   const duplicate = useMemo(
-    () => (mode === 'new' && name.trim().length > 1 ? DB.findCustomerByName(name) : null),
-    [mode, name],
+    () => (adding && name.trim().length > 1 ? DB.findCustomerByName(name) : null),
+    [adding, name],
   );
 
-  const total = blouses.length;
-  const eCount = blouses.filter(b => b.emergency).length;
-  const gCount = total - eCount;
-  const priceTotal = blouses.reduce((s, b) => s + b.price, 0);
-  const customerName = mode === 'old' ? selected?.name ?? '' : name.trim();
+  const pieces = stitchCount(lines);
+  const emergencyPieces = emergencyCount(lines);
+  const priceTotal = draftTotal(lines);
+  const customerName = selected?.name ?? name.trim();
+  const hasSmall = smallLines(lines).length > 0;
 
-  // ── Quote (only on the delivery step) ────────────────────────
+  // ── Quote (only on the delivery step, and only for stitching) ──
   const plan = useMemo(() => {
-    if (step !== 2 || total === 0) return null;
+    if (step !== 2 || pieces === 0) return null;
     const base = buildInput();
     const taken = Object.values(extras).filter((x): x is WeekExtra => !!x);
     const input = { ...base, weekExtras: [...(base.weekExtras ?? []), ...taken] };
 
-    const req = PRIORITIES
-      .map(priority => ({ priority, count: priority === 'emergency' ? eCount : gCount }))
-      .filter(r => r.count > 0);
+    const req: QuotePartRequest[] = quoteRequests(lines);
     const quoted = quote(input, req);
     // Single-priority orders also show what the other priority would give.
-    const both = req.length === 1 ? quoteBoth(input, total) : null;
+    const both = req.length === 1 ? quoteBoth(input, pieces, fullDayCount(lines)) : null;
 
     const prior: PriorPart[] = [];
     let changed = false;
@@ -141,17 +171,17 @@ export function NewOrderScreen() {
       let p: PlannedPart;
       if (isDate(c)) {
         const check = checkDate(input, r, c, prior);
-        p = { ...r, offered: q.dateOffered, chosen: check.ok ? c : null, custom: true, check, stitchDays: [] };
+        p = { priority: r.priority, count: r.count, offered: q.dateOffered, chosen: check.ok ? c : null, custom: true, check, stitchDays: [] };
         changed = true;
       } else if (changed && q.dateOffered) {
         // An earlier part has its own date: re-check this part's offered date against it.
         const check = checkDate(input, r, q.dateOffered, prior);
         const chosen = check.ok ? q.dateOffered : check.nearestValid ?? null;
-        p = { ...r, offered: chosen, chosen, custom: false, stitchDays: check.ok ? q.stitchDays : [] };
+        p = { priority: r.priority, count: r.count, offered: chosen, chosen, custom: false, stitchDays: check.ok ? q.stitchDays : [] };
       } else {
-        p = { ...r, offered: q.dateOffered, chosen: q.dateOffered, custom: false, stitchDays: q.stitchDays };
+        p = { priority: r.priority, count: r.count, offered: q.dateOffered, chosen: q.dateOffered, custom: false, stitchDays: q.stitchDays };
       }
-      if (p.chosen) prior.push({ count: r.count, priority: r.priority, date: p.chosen });
+      if (p.chosen) prior.push({ count: r.count, priority: r.priority, date: p.chosen, fullDayCount: r.fullDayCount });
       return p;
     });
 
@@ -159,9 +189,9 @@ export function NewOrderScreen() {
     return { parts, both, strip };
     // `version` changes after every DB write: re-quote then.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, total, eCount, gCount, customDate, extras, buildInput, version]);
+  }, [step, pieces, lines, customDate, extras, buildInput, version]);
 
-  const canConfirm = !!plan && plan.parts.every(p => p.chosen);
+  const canConfirm = pieces > 0 ? !!plan && plan.parts.every(p => p.chosen) : isDate(smallDate);
 
   // ── Navigation between steps ─────────────────────────────────
   const goTo = (s: number) => {
@@ -171,30 +201,61 @@ export function NewOrderScreen() {
   };
 
   const nextFromCustomer = () => {
-    if (mode === 'new' && !name.trim()) { setNameError(STRINGS.customerNameRequired); return; }
-    if (mode === 'old' && !selected) return;
+    if (adding && !name.trim()) { setNameError(STRINGS.customerNameRequired); return; }
+    if (!adding && !selected) return;
     setNameError('');
     goTo(1);
   };
 
-  const nextFromBlouses = () => {
+  const nextFromWork = () => {
+    const unnamed = lines.find(missingName);
+    if (unnamed) {
+      setShowErrors(true);
+      setOpenLine(unnamed.key);
+      showListNext.current = true;
+      scrollRef.current?.scrollToEnd({ animated: true });
+      return;
+    }
     setCustomDate(NO_DATES);
     setExtras({});
+    setSmallDate(addDays(today, 2));
     goTo(2);
   };
 
-  // ── Blouse edits ─────────────────────────────────────────────
-  const updateBlouse = (key: number, patch: Partial<DraftBlouse>) =>
-    setBlouses(bs => bs.map(b => (b.key === key ? { ...b, ...patch } : b)));
+  // ── Customer ─────────────────────────────────────────────────
+  const startAdding = () => {
+    const typed = query.trim();
+    const isNumber = /^[\d\s+-]+$/.test(typed);
+    setName(typed && !isNumber ? typed : '');
+    setPhone(isNumber ? typed : '');
+    setNameError('');
+    setAdding(true);
+  };
 
-  const setType = (b: DraftBlouse, type: BlouseType) =>
-    updateBlouse(b.key, {
-      type,
-      price: b.priceEdited ? b.price : type === 'astar' ? settings.priceAstar : settings.priceDesigner,
-    });
+  // ── Work ─────────────────────────────────────────────────────
+  const countOf = (work: WorkKey) => lines.find(l => l.work === work)?.pieces.length ?? 0;
+  const noteFor = (work: WorkKey) => {
+    const rate = rateFor(settings, work);
+    return rate > 0 ? `₹${rate}` : undefined;
+  };
+
+  const tapWork = (work: WorkKey) => {
+    const price = rateFor(settings, work);
+    const res = addWork(lines, work, price);
+    setLines(res.lines);
+    // No price yet, or a name is needed: open the line and bring it into view to type it.
+    const added = res.lines.find(l => l.key === res.key)?.pieces.at(-1);
+    const needsTyping = work === 'other' || added?.price === 0;
+    showListNext.current = needsTyping;
+    if (needsTyping) setOpenLine(res.key);
+  };
+
+  const addToLine = (line: DraftLine) => setLines(addWork(lines, line.work, rateFor(settings, line.work)).lines);
 
   const setAllEmergency = (on: boolean) => {
-    setBlouses(bs => bs.map(b => ({ ...b, emergency: on })));
+    setLines(ls => ls.map(l => (isStitchWork(l.work)
+      ? { ...l, pieces: l.pieces.map(p => ({ ...p, emergency: on })) }
+      : l)));
     setCustomDate(NO_DATES);
     setExtras({});
   };
@@ -206,56 +267,89 @@ export function NewOrderScreen() {
 
   // ── Save ─────────────────────────────────────────────────────
   const handleConfirm = () => {
-    if (!plan || !canConfirm) return;
-    const customerId = mode === 'old' && selected
+    if (!canConfirm) return;
+    const customerId = selected
       ? selected.id
       : DB.createCustomer(name.trim(), phone.trim() || undefined);
-    const orderId = DB.createOrder(customerId, nowIso(), plan.parts.map(p => ({
-      priority: p.priority,
-      promisedDelivery: p.chosen!,
-      blouses: blouses
-        .filter(b => (b.emergency ? 'emergency' : 'general') === p.priority)
-        .map(b => ({ type: b.type, price: b.price, name: b.name })),
-    })), undefined, { advance, previousDue });
-    for (const pr of PRIORITIES) {
+    const dates: Partial<Record<Priority, string>> = {};
+    for (const p of plan?.parts ?? []) dates[p.priority] = p.chosen!;
+    const orderId = DB.createOrder(customerId, nowIso(), draftParts(lines, dates, smallDate), undefined, { advance, previousDue });
+    for (const pr of ['emergency', 'general'] as Priority[]) {
       const x = extras[pr];
       if (x && isDate(customDate[pr])) DB.addWeekExtra(x);
     }
     refresh();
-    Alert.alert(STRINGS.orderSaved, STRINGS.orderSavedNo(orderNo(orderId)), [{ text: STRINGS.ok, onPress: resetForm }]);
+    setSaved(DB.loadOrderDetails(orderId));
+    Keyboard.dismiss();
+    scrollRef.current?.scrollTo({ y: 0, animated: false });
   };
 
   const resetForm = () => {
-    setStep(0); setMode('new'); setName(''); setPhone(''); setQuery(''); setSelected(null);
-    setBlouses([newBlouse()]); setCustomDate(NO_DATES); setExtras({});
-    setAdvance(0); setPreviousDue(0);
+    setStep(0); setAdding(false); setName(''); setPhone(''); setQuery(''); setSelected(null);
+    setLines([]); setOpenLine(null); setShowErrors(false); setCustomDate(NO_DATES); setSmallDate(''); setExtras({});
+    setAdvance(0); setPreviousDue(0); setSaved(null); setBillOpen(false);
   };
+
+  // ── Saved ────────────────────────────────────────────────────
+  if (saved) {
+    return (
+      <View style={[styles.container, { paddingTop: insets.top }]}>
+        <ScreenHeader title={STRINGS.newOrderTitle} />
+        <ScrollView contentContainerStyle={styles.content}>
+          <Section accent={COLORS.success}>
+            <View style={styles.savedBlock}>
+              <Ionicons name="checkmark-circle" size={56} color={COLORS.success} />
+              <Text style={styles.savedTitle}>{STRINGS.orderSaved}</Text>
+              <Text style={styles.savedSub}>{STRINGS.orderSavedNo(orderNo(saved.order.id))}</Text>
+              <Text style={styles.savedSub}>{saved.customer.name} · {STRINGS.orderTotal(priceTotal)}</Text>
+            </View>
+          </Section>
+          <Actions page>
+            <Button label={STRINGS.sendBill} icon="receipt-outline" onPress={() => setBillOpen(true)} />
+            <Button label={STRINGS.newOrderAgain} icon="add-circle-outline" variant="secondary" onPress={resetForm} />
+          </Actions>
+        </ScrollView>
+        {billOpen && <OrderBillModal card={saved} onClose={() => setBillOpen(false)} />}
+      </View>
+    );
+  }
 
   // ── Render ───────────────────────────────────────────────────
   return (
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    // Android apps are edge-to-edge: the window no longer shrinks for the keyboard, so the
+    // view must make room itself on every platform, or the boxes stay under the keyboard.
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <ScreenHeader
           title={STRINGS.newOrderTitle}
           subtitle={step > 0 && customerName ? customerName : undefined}
         />
-        <Steps steps={[STRINGS.stepCustomer, STRINGS.stepBlouses, STRINGS.stepDelivery]} current={step} onPress={goTo} />
+        <Steps steps={[STRINGS.stepCustomer, STRINGS.stepWork, STRINGS.stepDelivery]} current={step} onPress={goTo} />
 
-        <ScrollView ref={scrollRef} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <ScrollView
+          ref={scrollRef}
+          {...keepVisible}
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+          onContentSizeChange={() => {
+            if (!showListNext.current) return;
+            showListNext.current = false;
+            scrollRef.current?.scrollToEnd({ animated: true });
+          }}
+        >
           {/* ── Step 1: Customer ── */}
           {step === 0 && (
             <Section title={STRINGS.stepCustomer}>
-              <Segmented
-                style={styles.segment}
-                value={mode}
-                onChange={m => { setMode(m); setNameError(''); }}
-                options={[
-                  { value: 'new', label: STRINGS.newCustomer },
-                  { value: 'old', label: STRINGS.oldCustomer },
-                ]}
-              />
-
-              {mode === 'new' ? (
+              {selected ? (
+                <View style={styles.selectedCustomer}>
+                  <Ionicons name="person-circle" size={44} color={COLORS.accent} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.custName}>{selected.name}</Text>
+                    {selected.phone ? <Text style={styles.custSub}>{selected.phone}</Text> : null}
+                  </View>
+                  <Button label={STRINGS.change} icon="swap-horizontal" size="small" variant="secondary" onPress={() => setSelected(null)} />
+                </View>
+              ) : adding ? (
                 <>
                   <TextField
                     label={STRINGS.customerName}
@@ -268,7 +362,7 @@ export function NewOrderScreen() {
                   {duplicate && (
                     <TouchableOpacity
                       style={styles.dupHint}
-                      onPress={() => { setMode('old'); setSelected({ ...duplicate, orderCount: 0 }); }}
+                      onPress={() => { setAdding(false); setSelected({ ...duplicate, orderCount: 0 }); }}
                     >
                       <Ionicons name="information-circle" size={20} color={COLORS.tagGeneral} />
                       <Text style={styles.dupText}>{STRINGS.customerExists(duplicate.name)}</Text>
@@ -280,28 +374,32 @@ export function NewOrderScreen() {
                     onChangeValue={setPhone}
                     keyboardType="phone-pad"
                   />
+                  <Actions>
+                    <Button label={STRINGS.backToSearch} icon="search" size="small" variant="ghost" onPress={() => setAdding(false)} />
+                  </Actions>
                 </>
-              ) : selected ? (
-                <View style={styles.selectedCustomer}>
-                  <Ionicons name="person-circle" size={44} color={COLORS.accent} />
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.custName}>{selected.name}</Text>
-                    {selected.phone ? <Text style={styles.custSub}>{selected.phone}</Text> : null}
-                  </View>
-                  <Button label={STRINGS.change} icon="swap-horizontal" size="small" variant="secondary" onPress={() => setSelected(null)} />
-                </View>
               ) : (
                 <>
                   <TextField
                     value={query}
                     onChangeValue={setQuery}
                     placeholder={STRINGS.customerSearch}
+                    autoCapitalize="words"
                   />
-                  {customers.length === 0 ? (
+                  <Actions>
+                    <Button
+                      label={query.trim() ? STRINGS.addCustomerNamed(query.trim()) : STRINGS.newCustomer}
+                      icon="person-add-outline"
+                      size="small"
+                      variant="secondary"
+                      onPress={startAdding}
+                    />
+                  </Actions>
+                  {customers.length === 0 && query.trim() ? (
                     <Text style={styles.muted}>{STRINGS.customerNoMatch}</Text>
-                  ) : customers.map((c, i) => (
+                  ) : customers.map(c => (
                     <View key={c.id}>
-                      {i > 0 && <Separator />}
+                      <Separator inset={0} />
                       <TouchableOpacity style={styles.custRow} onPress={() => setSelected(c)}>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.custName}>{c.name}</Text>
@@ -319,125 +417,146 @@ export function NewOrderScreen() {
             </Section>
           )}
 
-          {/* ── Step 2: Blouses ── */}
+          {/* ── Step 2: Work ── */}
           {step === 1 && (
             <>
-              {blouses.map((b, i) => (
-                <Section
-                  key={b.key}
-                  title={STRINGS.blouseNumber(i + 1)}
-                  accent={b.emergency ? COLORS.emergency : undefined}
-                  right={blouses.length > 1 ? (
-                    <Button
-                      label={STRINGS.removeBlouse}
-                      icon="trash-outline"
-                      size="small"
-                      variant="dangerGhost"
-                      onPress={() => setBlouses(bs => bs.filter(x => x.key !== b.key))}
+              {/* Tiles come first and never move, so repeated taps can't land on the wrong one. */}
+              <Section title={STRINGS.workGroupStitching}>
+                <TileGrid>
+                  {STITCH_TYPES.map(t => (
+                    <WorkTile
+                      key={t}
+                      label={workLabel(t)}
+                      note={t === 'navvari' ? [STRINGS.fullDay, noteFor(t)].filter(Boolean).join(' · ') : noteFor(t)}
+                      count={countOf(t)}
+                      onPress={() => tapWork(t)}
                     />
-                  ) : undefined}
-                >
-                  <Segmented
-                    style={styles.segment}
-                    value={b.type}
-                    onChange={t => setType(b, t)}
-                    options={[
-                      { value: 'astar', label: STRINGS.astar },
-                      { value: 'designer', label: STRINGS.designer },
-                    ]}
-                  />
-                  <TextField
-                    label={STRINGS.blouseName}
-                    value={b.name}
-                    onChangeValue={v => updateBlouse(b.key, { name: v })}
-                    placeholder={STRINGS.blouseNamePlaceholder}
-                  />
-                  <Row style={styles.priceRow}>
-                    <Text style={styles.priceLabel}>{STRINGS.price}</Text>
-                    <NumericTextInput
-                      style={styles.priceInput}
-                      value={b.price}
-                      min={0}
-                      onChangeValue={n => updateBlouse(b.key, { price: n, priceEdited: true })}
-                    />
+                  ))}
+                </TileGrid>
+              </Section>
+
+              <Section title={STRINGS.workGroupAlter} subtitle={STRINGS.workSmallHint}>
+                <TileGrid>
+                  {ALTER_KINDS.map(k => (
+                    <WorkTile key={k} label={workLabel(k)} note={noteFor(k)} count={countOf(k)} onPress={() => tapWork(k)} />
+                  ))}
+                </TileGrid>
+              </Section>
+
+              <Section title={STRINGS.workGroupOther} subtitle={STRINGS.workSmallHint}>
+                <TileGrid>
+                  {OTHER_SMALL_KINDS.map(k => (
+                    <WorkTile key={k} label={workLabel(k)} note={noteFor(k)} count={countOf(k)} onPress={() => tapWork(k)} />
+                  ))}
+                </TileGrid>
+              </Section>
+
+              {lines.length > 0 && (
+                <Section title={STRINGS.workInOrder} count={lines.reduce((s, l) => s + l.pieces.length, 0)}>
+                  {lines.map((l, i) => (
+                    <View key={l.key}>
+                      {i > 0 && <Separator />}
+                      <LineRow
+                        line={l}
+                        open={openLine === l.key}
+                        showError={showErrors}
+                        onToggle={() => {
+                          // The last line opens below the screen's edge: bring it into view.
+                          showListNext.current = openLine !== l.key && i === lines.length - 1;
+                          setOpenLine(o => (o === l.key ? null : l.key));
+                        }}
+                        onAdd={() => addToLine(l)}
+                        onRemoveLast={() => setLines(ls => removeLastPiece(ls, l.key))}
+                        onPiece={(pieceKey, patch) => setLines(ls => updatePiece(ls, l.key, pieceKey, patch))}
+                      />
+                    </View>
+                  ))}
+                  <Separator inset={0} />
+                  <Row style={styles.totalRow}>
+                    <Text style={styles.totalValue}>{STRINGS.orderTotal(priceTotal)}</Text>
                   </Row>
-                  <View style={styles.checkbox}>
-                    <Checkbox
-                      label={STRINGS.emergencyCheck}
-                      value={b.emergency}
-                      color={COLORS.emergency}
-                      onChange={v => updateBlouse(b.key, { emergency: v })}
-                    />
-                  </View>
+                  {emergencyPieces > 0 && emergencyPieces < pieces && <Text style={styles.hint}>{STRINGS.splitHint}</Text>}
                 </Section>
-              ))}
-              <Actions page>
-                <Button
-                  label={STRINGS.addBlouse}
-                  icon="add-circle-outline"
-                  variant="secondary"
-                  onPress={() => setBlouses(bs => [...bs, newBlouse()])}
-                />
-              </Actions>
-              <Section>
-                <Row style={styles.totalRow}>
-                  <Text style={styles.totalLabel}>{STRINGS.blouses(total)}</Text>
-                  <Text style={styles.totalValue}>{STRINGS.orderTotal(priceTotal)}</Text>
-                </Row>
-                {eCount > 0 && gCount > 0 && <Text style={styles.hint}>{STRINGS.splitHint}</Text>}
-              </Section>
-              <Section title={STRINGS.moneyTitle} subtitle={STRINGS.moneyHint}>
-                <NumberInput label={STRINGS.moneyAdvance} value={advance} onChangeValue={setAdvance} />
-                <NumberInput label={STRINGS.moneyPreviousDue} value={previousDue} onChangeValue={setPreviousDue} />
-              </Section>
+              )}
             </>
           )}
 
           {/* ── Step 3: Delivery ── */}
-          {step === 2 && plan && (
+          {step === 2 && (
             <>
               <Section title={STRINGS.summary}>
                 <Text style={styles.summaryName}>{customerName}</Text>
-                {blouses.map((b, i) => (
-                  <Row key={b.key} style={styles.summaryRow}>
-                    <Text style={styles.summaryText}>
-                      {i + 1}. {b.name.trim() || (b.type === 'astar' ? STRINGS.astar : STRINGS.designer)}
-                      {b.name.trim() ? ` (${b.type === 'astar' ? STRINGS.astar : STRINGS.designer})` : ''}
-                    </Text>
-                    {b.emergency && <Tag label={STRINGS.emergency} color={COLORS.emergency} />}
-                    <Text style={styles.summaryPrice}>₹{b.price}</Text>
+                {draftGroups(lines).map((g, i) => (
+                  <Row key={i} style={styles.summaryRow}>
+                    <Text style={styles.summaryText}>{groupLabel(g)}{g.qty > 1 ? ` × ${g.qty}` : ''}</Text>
+                    {g.emergency && <Tag label={STRINGS.emergency} color={COLORS.emergency} />}
+                    <Text style={styles.summaryPrice}>₹{g.price * g.qty}</Text>
                   </Row>
                 ))}
                 <Text style={styles.summaryTotal}>{STRINGS.orderTotal(priceTotal)}</Text>
               </Section>
 
-              {plan.parts.map(p => (
-                <PartCard
-                  key={p.priority}
-                  part={p}
-                  custom={customDate[p.priority]}
-                  extra={extras[p.priority]}
-                  minDate={addDays(today, 1)}
-                  offDates={daysOff.map(d => d.date)}
-                  onCustom={v => setCustom(p.priority, v)}
-                  onTakeExtra={x => setExtras(e => ({ ...e, [p.priority]: x }))}
-                />
-              ))}
+              {pieces === 0 ? (
+                <Section title={STRINGS.smallOnlyDate} subtitle={STRINGS.smallOnlyHint} accent={COLORS.tagGeneral}>
+                  <DateField
+                    value={smallDate}
+                    onChange={setSmallDate}
+                    minDate={today}
+                    offDates={daysOff.map(d => d.date)}
+                  />
+                </Section>
+              ) : plan && (
+                <>
+                  {plan.parts.map(p => (
+                    <PartCard
+                      key={p.priority}
+                      part={p}
+                      custom={customDate[p.priority]}
+                      extra={extras[p.priority]}
+                      minDate={addDays(today, 1)}
+                      offDates={daysOff.map(d => d.date)}
+                      onCustom={v => setCustom(p.priority, v)}
+                      onTakeExtra={x => setExtras(e => ({ ...e, [p.priority]: x }))}
+                    />
+                  ))}
+                  {hasSmall && <Text style={styles.noteBetween}>{STRINGS.smallWithOrder}</Text>}
 
-              {plan.both && (
-                <AltCard
-                  quote={eCount === 0 ? plan.both.emergency : plan.both.general}
-                  label={eCount === 0 ? STRINGS.allEmergency : STRINGS.allGeneral}
-                  onPress={() => setAllEmergency(eCount === 0)}
-                />
+                  {plan.both && (
+                    <AltCard
+                      quote={emergencyPieces === 0 ? plan.both.emergency : plan.both.general}
+                      label={emergencyPieces === 0 ? STRINGS.allEmergency : STRINGS.allGeneral}
+                      onPress={() => setAllEmergency(emergencyPieces === 0)}
+                    />
+                  )}
+
+                  <Section title={STRINGS.capacity}>
+                    <CapacityStrip weeks={plan.strip} />
+                  </Section>
+                </>
               )}
 
-              <Section title={STRINGS.capacity}>
-                <CapacityStrip weeks={plan.strip} />
+              <Section title={STRINGS.moneyTitle} subtitle={STRINGS.moneyHint}>
+                <NumberInput inline label={STRINGS.moneyAdvance} value={advance} onChangeValue={setAdvance} />
+                <NumberInput inline label={STRINGS.moneyPreviousDue} value={previousDue} onChangeValue={setPreviousDue} />
+                {(advance > 0 || previousDue > 0) && (
+                  <Row style={styles.totalRow}>
+                    <Text style={styles.totalValue}>{STRINGS.ordersBalance(Math.max(0, priceTotal + previousDue - advance))}</Text>
+                  </Row>
+                )}
               </Section>
             </>
           )}
         </ScrollView>
+
+        {/* What is in the order so far; tap to see the list. */}
+        {/* Hidden while typing: on a small phone every line of space is needed to see the boxes. */}
+        {step === 1 && lines.length > 0 && !typing && (
+          <TouchableOpacity style={styles.summaryBar} onPress={() => scrollRef.current?.scrollToEnd({ animated: true })} activeOpacity={0.7}>
+            <Text style={styles.summaryBarText} numberOfLines={1}>{draftSummary(lines)}</Text>
+            <Text style={styles.summaryBarTotal}>₹{priceTotal}</Text>
+            <Ionicons name="chevron-down" size={20} color={COLORS.accent} />
+          </TouchableOpacity>
+        )}
 
         {/* Sticky footer: back / next */}
         <Row style={styles.footer}>
@@ -450,12 +569,12 @@ export function NewOrderScreen() {
               icon="chevron-forward"
               iconRight
               onPress={nextFromCustomer}
-              disabled={mode === 'old' ? !selected : !name.trim()}
+              disabled={adding ? !name.trim() : !selected}
               style={styles.footerNext}
             />
           )}
           {step === 1 && (
-            <Button label={STRINGS.next} icon="chevron-forward" iconRight onPress={nextFromBlouses} disabled={total === 0} style={styles.footerNext} />
+            <Button label={STRINGS.next} icon="chevron-forward" iconRight onPress={nextFromWork} disabled={lines.length === 0} style={styles.footerNext} />
           )}
           {step === 2 && (
             <Button label={STRINGS.confirmOrder} icon="checkmark" onPress={handleConfirm} disabled={!canConfirm} style={styles.footerNext} />
@@ -463,6 +582,102 @@ export function NewOrderScreen() {
         </Row>
       </View>
     </KeyboardAvoidingView>
+  );
+}
+
+// ── One kind of work in the order ─────────────────────────────
+function LineRow({
+  line, open, showError, onToggle, onAdd, onRemoveLast, onPiece,
+}: {
+  line: DraftLine;
+  open: boolean;
+  showError: boolean;
+  onToggle: () => void;
+  onAdd: () => void;
+  onRemoveLast: () => void;
+  onPiece: (pieceKey: number, patch: Partial<DraftPiece>) => void;
+}) {
+  const stitching = isStitchWork(line.work);
+  const isOther = line.work === 'other';
+  const qty = line.pieces.length;
+  const samePrice = line.pieces.every(p => p.price === line.pieces[0].price);
+  const anyEmergency = line.pieces.some(p => p.emergency);
+  return (
+    <View>
+      <Row style={styles.lineRow}>
+        <TouchableOpacity style={styles.lineMain} onPress={onToggle} activeOpacity={0.7}>
+          <Ionicons name={open ? 'chevron-down' : 'chevron-forward'} size={20} color={COLORS.textMuted} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.lineTitle}>{workLabel(line.work)}</Text>
+            <Text style={styles.lineSub}>
+              ₹{lineTotal(line)}{qty > 1 && samePrice ? ` (${STRINGS.billEach(line.pieces[0].price)})` : ''}
+            </Text>
+            {(anyEmergency || line.work === 'navvari') && (
+              <Row style={{ flexWrap: 'wrap' }}>
+                {anyEmergency && <Tag label={STRINGS.emergency} color={COLORS.emergency} />}
+                {line.work === 'navvari' && <Tag label={STRINGS.fullDay} color={COLORS.tagGeneral} />}
+              </Row>
+            )}
+          </View>
+        </TouchableOpacity>
+        <Stepper
+          value={qty}
+          onChange={n => (n > qty ? onAdd() : onRemoveLast())}
+          removeLabel={STRINGS.removeWork}
+        />
+      </Row>
+      {open && (
+        <View style={styles.lineMore}>
+          <Row style={styles.pieceRow}>
+            <View style={styles.pieceNo} />
+            <Text style={[styles.pieceHead, styles.pieceName]}>{isOther ? STRINGS.workOtherName : STRINGS.workName}</Text>
+            <Text style={[styles.pieceHead, styles.piecePrice]}>{STRINGS.workPriceHead}</Text>
+            {stitching && <Text style={[styles.pieceHead, styles.pieceUrgent]}>{STRINGS.emergency}</Text>}
+          </Row>
+          {line.pieces.map((p, i) => {
+            const nameMissing = showError && pieceNeedsName(line.work, p);
+            return (
+              <Row key={p.key} style={styles.pieceRow}>
+                <Text style={[styles.pieceNo, styles.pieceNoText]}>{i + 1}</Text>
+                <TextInput
+                  style={[styles.pieceInput, styles.pieceName, nameMissing && styles.pieceInputError]}
+                  value={p.name}
+                  onChangeText={v => onPiece(p.key, { name: v })}
+                  placeholder={isOther ? STRINGS.workOtherPlaceholder : STRINGS.workNamePlaceholder}
+                  placeholderTextColor={COLORS.textMuted}
+                  accessibilityLabel={isOther ? STRINGS.workOtherName : STRINGS.workName}
+                />
+                <NumericTextInput
+                  style={[styles.pieceInput, styles.piecePrice, styles.piecePriceInput]}
+                  value={p.price}
+                  min={0}
+                  onChangeValue={n => onPiece(p.key, { price: n })}
+                  accessibilityLabel={STRINGS.workPriceHead}
+                />
+                {stitching && (
+                  <View style={styles.pieceUrgent}>
+                    <TouchableOpacity
+                      onPress={() => onPiece(p.key, { emergency: !p.emergency })}
+                      hitSlop={SPACE.sm}
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: p.emergency }}
+                      accessibilityLabel={STRINGS.emergency}
+                    >
+                      <Ionicons
+                        name={p.emergency ? 'checkbox' : 'square-outline'}
+                        size={28}
+                        color={p.emergency ? COLORS.emergency : COLORS.textMuted}
+                      />
+                    </TouchableOpacity>
+                  </View>
+                )}
+              </Row>
+            );
+          })}
+          {showError && missingName(line) && <Text style={styles.pieceError}>{STRINGS.workOtherRequired}</Text>}
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -559,34 +774,41 @@ function AltCard({ quote: q, label, onPress }: { quote: QuotePart; label: string
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bgLight },
   content: { paddingBottom: LAYOUT.screenBottom },
-  segment: { marginHorizontal: LAYOUT.inset, marginVertical: SPACE.sm },
   muted: { fontSize: FONT.size, color: COLORS.textMuted, paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
   hint: { fontSize: FONT.sizeSmall, color: COLORS.textMuted, paddingHorizontal: LAYOUT.inset, paddingBottom: SPACE.sm },
+  noteBetween: {
+    fontSize: FONT.sizeSmall, color: COLORS.textSecondary,
+    paddingHorizontal: LAYOUT.inset, marginTop: SPACE.sm,
+  },
   dupHint: {
     flexDirection: 'row', gap: SPACE.sm, alignItems: 'center', marginHorizontal: LAYOUT.inset, padding: SPACE.md,
-    borderRadius: LAYOUT.radiusSm, backgroundColor: '#EAF2FB',
+    borderRadius: LAYOUT.radiusSm, backgroundColor: COLORS.infoBg,
   },
   dupText: { flex: 1, fontSize: FONT.sizeSmall, color: COLORS.tagGeneral, fontWeight: FONT.weightMedium },
   selectedCustomer: { flexDirection: 'row', alignItems: 'center', gap: SPACE.md, padding: LAYOUT.inset },
   custRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
   custName: { fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.text },
   custSub: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, marginTop: 2 },
-  checkbox: { paddingHorizontal: LAYOUT.inset },
-  priceRow: { paddingHorizontal: LAYOUT.inset, paddingVertical: SPACE.sm, gap: SPACE.md },
-  priceLabel: { fontSize: FONT.size, color: COLORS.text, fontWeight: FONT.weightMedium, flex: 1 },
-  priceInput: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: LAYOUT.radiusSm,
-    padding: SPACE.md,
-    fontSize: FONT.sizeLarge,
-    backgroundColor: COLORS.bgInput,
-    width: 120,
-    textAlign: 'right',
-    color: COLORS.text,
+  lineRow: { gap: SPACE.sm, paddingRight: LAYOUT.inset, paddingLeft: SPACE.md, paddingVertical: SPACE.sm },
+  lineMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: SPACE.xs, paddingVertical: SPACE.xs },
+  lineTitle: { fontSize: FONT.size, fontWeight: FONT.weightBold, color: COLORS.text },
+  lineSub: { fontSize: FONT.sizeSmall, color: COLORS.textSecondary, marginTop: 2 },
+  lineMore: { backgroundColor: COLORS.brandTint, paddingBottom: SPACE.md },
+  pieceRow: { gap: SPACE.sm, paddingHorizontal: LAYOUT.inset, paddingTop: SPACE.sm },
+  pieceNo: { width: 18 },
+  pieceNoText: { fontSize: FONT.size, fontWeight: FONT.weightMedium, color: COLORS.textSecondary },
+  pieceHead: { fontSize: FONT.sizeXSmall, fontWeight: FONT.weightMedium, color: COLORS.textSecondary },
+  pieceName: { flex: 1, minWidth: 0 },
+  piecePrice: { width: 72 },
+  pieceUrgent: { width: 52, alignItems: 'center', textAlign: 'center' },
+  pieceInput: {
+    borderWidth: 1, borderColor: COLORS.border, borderRadius: LAYOUT.radiusSm, backgroundColor: COLORS.bg,
+    paddingHorizontal: SPACE.sm, paddingVertical: SPACE.sm, fontSize: FONT.size, color: COLORS.text,
   },
-  totalRow: { justifyContent: 'space-between', paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
-  totalLabel: { fontSize: FONT.size, color: COLORS.textSecondary },
+  pieceInputError: { borderColor: COLORS.danger },
+  piecePriceInput: { textAlign: 'right' },
+  pieceError: { fontSize: FONT.sizeSmall, color: COLORS.danger, paddingHorizontal: LAYOUT.inset, paddingTop: SPACE.xs },
+  totalRow: { justifyContent: 'flex-end', paddingHorizontal: LAYOUT.inset, paddingVertical: LAYOUT.rowY },
   totalValue: { fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.text },
   summaryName: {
     fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.text,
@@ -612,6 +834,16 @@ const styles = StyleSheet.create({
   altLabel: { fontSize: FONT.size, color: COLORS.text, fontWeight: FONT.weightMedium },
   altHint: { fontSize: FONT.sizeSmall, color: COLORS.tagGeneral, marginTop: 2 },
   altValue: { fontSize: FONT.sizeLarge, fontWeight: FONT.weightBold, color: COLORS.textSecondary },
+  savedBlock: { alignItems: 'center', gap: SPACE.xs, padding: SPACE.xl },
+  savedTitle: { fontSize: FONT.sizeTitle, fontWeight: FONT.weightBold, color: COLORS.text },
+  savedSub: { fontSize: FONT.size, color: COLORS.textSecondary, textAlign: 'center' },
+  summaryBar: {
+    flexDirection: 'row', alignItems: 'center', gap: SPACE.sm, minHeight: 44,
+    paddingHorizontal: LAYOUT.inset, paddingVertical: SPACE.sm, backgroundColor: COLORS.brandTint,
+    borderTopWidth: 1, borderTopColor: COLORS.border,
+  },
+  summaryBarText: { flex: 1, fontSize: FONT.sizeSmall, color: COLORS.text },
+  summaryBarTotal: { fontSize: FONT.size, fontWeight: FONT.weightBold, color: COLORS.text },
   footer: {
     gap: LAYOUT.buttonGap, paddingHorizontal: LAYOUT.gutter, paddingVertical: SPACE.sm, backgroundColor: COLORS.bg,
     borderTopWidth: 1, borderTopColor: COLORS.border,

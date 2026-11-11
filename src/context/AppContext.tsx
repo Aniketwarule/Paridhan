@@ -66,6 +66,7 @@ const EMPTY: ScheduleResult = {
   willMiss: [],
   willMissParts: [],
   changes: [],
+  weekLoad: {},
 };
 
 const AppContext = createContext<AppContextValue | null>(null);

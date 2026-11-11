@@ -70,6 +70,11 @@ export interface Blouse {
   status: BlouseStatus;
   /** Day it was actually stitched (set when status = done). */
   doneDate?: DateStr;
+  /**
+   * Takes a whole working day on its own (e.g. a nav-vari saree): nothing else is planned
+   * that day, and it uses up that day's amount.
+   */
+  fullDay?: boolean;
 }
 
 /** "Take extra anyway": +n blouses for the week starting at weekStart. */
@@ -137,11 +142,15 @@ export interface ScheduleResult {
   willMissParts: string[];
   /** What moved compared to `previous`. */
   changes: Change[];
+  /** Slots used per week (key = week start): done + planned, a full-day piece counting its whole day. */
+  weekLoad: Record<DateStr, number>;
 }
 
 export interface QuotePartRequest {
   count: number;
   priority: Priority;
+  /** How many of `count` take a whole day each (see Blouse.fullDay). Default 0. */
+  fullDayCount?: number;
 }
 
 export interface WeekUsage {
